@@ -1,9 +1,8 @@
 const mysql = require('mysql2/promise');
 const Redis = require('ioredis');
-const yts = require('yt-search');
 const axios = require('axios');
 const { AuthenticationError, logInfo, logWarning, logError } = require('../Helper/errorHandler');
-const { enqueueMessage, setProcessMessageFunction  } = require('../Helper/whatsappUtils');
+const { enqueueMessage, setProcessMessageFunction } = require('../Helper/whatsappUtils');
 
 const redis = new Redis({
     host: process.env.REDIS_HOST,
@@ -42,7 +41,7 @@ async function loadSettings(secret_whatsapp) {
 
         if (Object.keys(settings).length === 0) {
             const [rows] = await db.execute('SELECT * FROM whatsapp_bot WHERE secret_key = ?', [secret_whatsapp]);
-            
+
             if (rows.length > 0) {
                 settings = rows[0];
                 await redis.hmset(keyRedis, settings);
@@ -121,13 +120,13 @@ function formatQueryResult(queryResult, isValue, isResponse, responseTemplate, i
         if (!queryResult || queryResult.length === 0) {
             throw new AuthenticationError('No results found', 'No results found');
         }
-    
+
         let formattedResult = queryResult;
-    
+
         if (isValue) {
             formattedResult = queryResult.map(row => Object.values(row)[0]);
         }
-    
+
         let resultString;
         if (Array.isArray(formattedResult)) {
             resultString = formattedResult.map(item => {
@@ -146,7 +145,7 @@ function formatQueryResult(queryResult, isValue, isResponse, responseTemplate, i
         } else {
             resultString = formattedResult.toString();
         }
-    
+
         if (isResponse) {
             let response = responseTemplate;
             response = response.replace(/{{data}}/g, resultString);
@@ -158,7 +157,7 @@ function formatQueryResult(queryResult, isValue, isResponse, responseTemplate, i
             return resultString;
         }
     } catch (error) {
-        throw error; 
+        throw error;
     }
 }
 
@@ -176,8 +175,8 @@ async function processMessage(chatType, chatId, message, whatsappPort, secret_wh
             return { success: false, message: 'Bot is not active' };
         }
 
-        if(settings.type === 'group') {
-            if(chatType !== 'group') {
+        if (settings.type === 'group') {
+            if (chatType !== 'group') {
                 console.log('Group chat required')
                 return { success: false, message: 'Group chat required' };
             }
@@ -187,7 +186,7 @@ async function processMessage(chatType, chatId, message, whatsappPort, secret_wh
                 return { success: false, message: 'Group not allowed' };
             }
         } else {
-            if(chatType !== 'private') {
+            if (chatType !== 'private') {
                 console.log('Private chat required')
                 return { success: false, message: 'Private chat required' };
             }
@@ -215,20 +214,20 @@ async function processMessage(chatType, chatId, message, whatsappPort, secret_wh
     } catch (error) {
         throw error;
     }
-    
+
 }
 
 async function processQueue(whatsappPort, settings, secret_whatsapp, messageDelay) {
     try {
         let queue = messageQueues.get(whatsappPort);
         let activeCount = activeProcesses.get(whatsappPort);
-    
+
         while (queue.length > 0 && activeCount < settings.max_processes) {
             activeCount++;
             activeProcesses.set(whatsappPort, activeCount);
-    
+
             let { chatId, message, chatType } = queue.shift();
-            if(settings.bot_model === 'basic') {
+            if (settings.bot_model === 'basic') {
                 processItem(chatId, message, whatsappPort, secret_whatsapp, chatType, messageDelay).finally(() => {
                     activeCount--;
                     activeProcesses.set(whatsappPort, activeCount);
@@ -348,8 +347,8 @@ async function getDBConfig(secret_key, placement) {
         let dbConfig = await redis.hgetall(keyRedis);
 
         if (Object.keys(dbConfig).length === 0) {
-            const [rows] = await db.execute('SELECT * FROM bot_basic_model_query_config WHERE secret_key = ? AND placement = ?', [secret_whatsapp, placement]);
-            
+            const [rows] = await db.execute('SELECT * FROM bot_basic_model_query_config WHERE secret_key = ? AND placement = ?', [secret_key, placement]);
+
             if (rows.length > 0) {
                 dbConfig = rows[0];
                 await redis.hmset(keyRedis, dbConfig);
@@ -371,9 +370,10 @@ async function getDBConfig(secret_key, placement) {
     }
 }
 
+// Simple YouTube search replacement - no external dependencies
 async function searchSongYoutube(query) {
     try {
-        if(!query || query.trim() === '') {
+        if (!query || query.trim() === '') {
             return { success: true, message: 'No query provided' };
         }
 
@@ -381,27 +381,19 @@ async function searchSongYoutube(query) {
             query += ' song';
         }
 
-        const result = await yts({
-        query: query,
-        category: 'music',
-        });
+        const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
 
-        if (result.videos.length > 0) {
-        const potentialSongs = result.videos.filter(video => {
-            const durationInSeconds = video.duration.seconds;
-            return durationInSeconds >= 120 && durationInSeconds <= 600;
-        });
+        return {
+            success: true,
+            message: `🎵 *Music Search*\n\n🔍 Query: "${query}"\n\n▶️ Search on YouTube:\n${searchUrl}\n\n💡 Tip: Click the link to find and play your music!`
+        };
 
-        if (potentialSongs.length > 0) {
-            const video = potentialSongs[0];
-            return { success:true ,message: `🎵 *${video.title}*\n\nBy: ${video.author.name}\n\n▶️ Listen: ${video.url}\n\n⏱️ Duration: ${video.duration.timestamp}\n👀 Views: ${video.views.toLocaleString()}\n\nClick the link to listen in your browser or YouTube app!`};
-        }
-        }
-        
-        return { success: true, message: 'No songs found' };
     } catch (error) {
         logError('Error searching YouTube:', error);
-        throw error;
+        return {
+            success: false,
+            message: 'Error searching for music. Please try again later.'
+        };
     }
 }
 
@@ -433,7 +425,7 @@ async function getDayOffInfo(month) {
             const date = new Date(item.tanggal);
             const formattedDate = `${date.getDate()} ${monthNames[date.getMonth()]} ${date.getFullYear()}`;
             const holidayType = item.is_cuti ? "🏖️ Cuti Bersama" : "🎊 Hari Libur";
-            
+
             message += `*${formattedDate}*\n`;
             message += `${holidayType}: ${item.keterangan}\n\n`;
         });
@@ -491,9 +483,9 @@ async function processItem(chatId, message, whatsappPort, secret_whatsapp, chatT
                     let queryResult = await processQuery(botResponse.query, data, dataBindings, dbConfig.database);
                     if (queryResult) {
                         responseMessage = formatQueryResult(
-                            queryResult, 
-                            botResponse.is_value, 
-                            botResponse.is_response, 
+                            queryResult,
+                            botResponse.is_value,
+                            botResponse.is_response,
                             botResponse.response,
                             data
                         );
@@ -504,7 +496,7 @@ async function processItem(chatId, message, whatsappPort, secret_whatsapp, chatT
                 break;
             case 'searchsong':
                 const searchResult = await searchSongYoutube(dataString);
-                if(searchResult.success) {
+                if (searchResult.success) {
                     responseMessage = searchResult.message;
                 } else {
                     responseMessage = 'Error searching song.';
@@ -513,7 +505,7 @@ async function processItem(chatId, message, whatsappPort, secret_whatsapp, chatT
             case 'dayoff':
                 const dayOffInfo = await getDayOffInfo(dataArray[0]);
                 console.log(dayOffInfo);
-                if(dayOffInfo.success) {
+                if (dayOffInfo.success) {
                     responseMessage = dayOffInfo.message;
                 } else {
                     responseMessage = 'Error fetching day off information.';
@@ -524,12 +516,7 @@ async function processItem(chatId, message, whatsappPort, secret_whatsapp, chatT
         }
 
         enqueueMessage(chatId, responseMessage, whatsappPort, chatType, messageDelay, 'checkFalse', secret_whatsapp);
-        
-        // let sent = await sendResponseToWhatsApp(chatId, responseMessage, whatsappPort, chatType);
-        
-        // if (!sent) {
-        //     throw new AuthenticationError('Failed to send response', 'Failed to send response to WhatsApp');
-        // }
+
     } catch (error) {
         throw error;
     }

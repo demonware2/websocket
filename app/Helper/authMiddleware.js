@@ -362,7 +362,8 @@ function validateWhatsAppSecret(secret) {
         throw new AuthenticationError('Invalid WhatsApp secret', 'Invalid WhatsApp secret');
     }
 
-    const secretRegex = /^[A-Za-z0-9]$/;
+    // Fixed regex - was missing + for multiple characters
+    const secretRegex = /^[A-Za-z0-9]+$/;
     if (!secretRegex.test(secret)) {
         throw new AuthenticationError('Invalid WhatsApp secret format', 'Invalid WhatsApp secret format');
     }

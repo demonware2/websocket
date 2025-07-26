@@ -24,7 +24,7 @@ async function handleRequestHttp(req, res) {
             }
 
             switch (pathname) {
-                case '/test1':
+                case NODE_REQUEST + '/test1':
                     console.log('Handling system info request');
                     break;
                 default:

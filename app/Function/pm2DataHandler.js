@@ -72,10 +72,14 @@ function getCustomMetrics(pm_id) {
         logError(`No description found for process ${pm_id}`);
         reject(new Error('Process not found'));
       } else {
-        const metrics = processDescription[0].pm2_env.axm_monitor;
+        const metrics = processDescription[0].pm2_env.axm_monitor || {};
         const formattedMetrics = {};
         for (const key in metrics) {
-          formattedMetrics[key] = `${metrics[key].value} ${metrics[key].unit || ''}`;
+          if (metrics[key] && typeof metrics[key] === 'object') {
+            formattedMetrics[key] = `${metrics[key].value || ''} ${metrics[key].unit || ''}`.trim();
+          } else {
+            formattedMetrics[key] = metrics[key];
+          }
         }
         resolve(formattedMetrics);
       }
@@ -94,19 +98,30 @@ function getMetadata(pm_id) {
         reject(new Error('Process not found'));
       } else {
         const process = processDescription[0];
+        const pm2_env = process.pm2_env || {};
+
+        // Calculate uptime safely
+        let uptimeDisplay = 'N/A';
+        if (pm2_env.pm_uptime) {
+          const uptimeMs = Date.now() - pm2_env.pm_uptime;
+          const hours = Math.floor(uptimeMs / 3600000);
+          const minutes = Math.floor((uptimeMs % 3600000) / 60000);
+          uptimeDisplay = `${hours}h ${minutes}m`;
+        }
+
         const metadata = {
-          'App Name': process.name,
-          'Namespace': process.pm2_env.namespace || 'default',
-          'Version': process.pm2_env.version || 'N/A',
-          'Restarts': process.pm2_env.restart_time,
-          'Uptime': `${Math.floor(process.pm2_env.pm_uptime / 3600000)}h ${Math.floor((process.pm2_env.pm_uptime % 3600000) / 60000)}m`,
-          'Script path': process.pm2_env.pm_exec_path,
-          'Script args': process.pm2_env.args ? process.pm2_env.args.join(' ') : 'N/A',
-          'Interpreter': process.pm2_env.exec_interpreter,
-          'Interpreter args': process.pm2_env.node_args ? process.pm2_env.node_args.join(' ') : 'N/A',
-          'Exec mode': process.pm2_env.exec_mode,
-          'Node.js version': process.version,
-          'watch & reload': process.pm2_env.watch ? '✓' : '✗'
+          'App Name': process.name || 'N/A',
+          'Namespace': pm2_env.namespace || 'default',
+          'Version': pm2_env.version || 'N/A',
+          'Restarts': pm2_env.restart_time || 0,
+          'Uptime': uptimeDisplay,
+          'Script path': pm2_env.pm_exec_path || 'N/A',
+          'Script args': pm2_env.args ? pm2_env.args.join(' ') : 'N/A',
+          'Interpreter': pm2_env.exec_interpreter || 'N/A',
+          'Interpreter args': pm2_env.node_args ? pm2_env.node_args.join(' ') : 'N/A',
+          'Exec mode': pm2_env.exec_mode || 'N/A',
+          'Node.js version': process.version || 'N/A',
+          'watch & reload': pm2_env.watch ? '✓' : '✗'
         };
         resolve(metadata);
       }
@@ -126,9 +141,26 @@ async function getAllDataPM2() {
     };
 
     for (const process of processes) {
-      allData.logs[process.id] = await getLogsPM2(process.id);
-      allData.customMetrics[process.id] = await getCustomMetrics(process.id);
-      allData.metadata[process.id] = await getMetadata(process.id);
+      try {
+        allData.logs[process.id] = await getLogsPM2(process.id);
+      } catch (error) {
+        logError(`Failed to get logs for process ${process.id}:`, error);
+        allData.logs[process.id] = [];
+      }
+
+      try {
+        allData.customMetrics[process.id] = await getCustomMetrics(process.id);
+      } catch (error) {
+        logError(`Failed to get custom metrics for process ${process.id}:`, error);
+        allData.customMetrics[process.id] = {};
+      }
+
+      try {
+        allData.metadata[process.id] = await getMetadata(process.id);
+      } catch (error) {
+        logError(`Failed to get metadata for process ${process.id}:`, error);
+        allData.metadata[process.id] = {};
+      }
     }
 
     return allData;

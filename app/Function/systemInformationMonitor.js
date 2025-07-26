@@ -1,388 +1,790 @@
-const si = require('systeminformation');
-const TYPE_ALLOWED = ['sysinfo', 'system'];
-const { AuthenticationError } = require('../Helper/errorHandler');
+const os = require('os');
 const { exec } = require('child_process');
-const util = require('util');
-const execPromise = util.promisify(exec);
+let previousNetworkData = {};
+let previousDiskStats = null;
+let previousTimeStamp = Date.now();
 
-async function getSystemInfo(type) {
-  try {
-    if (!TYPE_ALLOWED.includes(type)) {
-      throw new AuthenticationError('Invalid type', `Invalid type requested: ${type}`);
-    }
+const maxBandwidth = 100 * 1024 * 1024
 
-    // Only do the full data collection for sysinfo type
-    if (type === 'system') {
-      const system = await si.system();
-      return {
-        timestamp: Date.now(),
-        system: {
-          manufacturer: system.manufacturer,
-          model: system.model,
-          version: system.version
+
+function getCpuInfo() {
+  const cpus = os.cpus();
+  const load = os.loadavg();
+  return {
+    load_1min: load[0],
+    load_5min: load[1],
+    load_15min: load[2],
+    cores: cpus.length,
+    model: cpus[0] && cpus[0].model ? cpus[0].model : 'Unknown',
+    speed: cpus[0] && cpus[0].speed ? cpus[0].speed : 0,
+    usage: Math.min(100, (load[0] / cpus.length) * 100),
+    manufacturer: getProcessorManufacturer(cpus[0] && cpus[0].model ? cpus[0].model : ''),
+    brand: cpus[0] && cpus[0].model ? cpus[0].model : 'Unknown',
+    physicalCores: Math.ceil(cpus.length / 2)
+  };
+}
+
+
+function getProcessorManufacturer(modelString) {
+  if (modelString.includes('Intel')) return 'Intel';
+  if (modelString.includes('AMD')) return 'AMD';
+  if (modelString.includes('Apple')) return 'Apple';
+  return 'Unknown';
+}
+
+
+function getDetailedCpuInfo() {
+  return new Promise((resolve) => {
+    exec('cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null || echo "N/A"', (error, stdout) => {
+      const temps = stdout.trim().split('\n').map(t => parseInt(t) / 1000).filter(t => !isNaN(t));
+      const avgTemp = temps.length ? temps.reduce((a, b) => a + b) / temps.length : null;
+
+      exec('cat /proc/cpuinfo | grep "cpu MHz"', (err, freqOut) => {
+        const frequencies = freqOut.trim().split('\n').map(line => {
+          const match = line.match(/([0-9.]+)$/);
+          return match ? parseFloat(match[1]) : null;
+        }).filter(f => f !== null);
+
+        const avgFreq = frequencies.length ?
+          frequencies.reduce((a, b) => a + b) / frequencies.length : null;
+
+        exec('mpstat -P ALL 1 1 | grep -v CPU | grep -v Average', (err2, coreOut) => {
+          let coreLoad = [];
+
+          if (!err2) {
+            const lines = coreOut.trim().split('\n');
+            coreLoad = lines.map(line => {
+              const parts = line.trim().split(/\s+/);
+              return parts.length > 10 ? 100 - parseFloat(parts[parts.length - 1]) : null;
+            }).filter(load => load !== null);
+          }
+
+          resolve({
+            temperature: avgTemp,
+            frequency: avgFreq ? (avgFreq / 1000).toFixed(2) : null,
+            coreLoad: coreLoad.length ? coreLoad : null
+          });
+        });
+      });
+    });
+  });
+}
+
+
+function getMemoryInfo() {
+  const total = os.totalmem();
+  const free = os.freemem();
+  const used = total - free;
+
+  return {
+    total,
+    free,
+    used,
+    active: used,
+    available: free,
+    usage: (used / total) * 100
+  };
+}
+
+function getDetailedMemoryInfo() {
+  return new Promise((resolve) => {
+    exec('cat /proc/meminfo', (error, stdout) => {
+      if (error) {
+        console.error(`Error getting detailed memory info: ${error}`);
+        resolve({});
+        return;
+      }
+
+      const memInfo = {};
+      const lines = stdout.trim().split('\n');
+
+      lines.forEach(line => {
+        const [key, valueWithUnit] = line.split(':');
+        const valueMatch = valueWithUnit && valueWithUnit.trim().match(/^(\d+)/);
+        if (valueMatch) {
+          memInfo[key.trim()] = parseInt(valueMatch[1]) * 1024;
         }
+      });
+
+      resolve({
+        buffers: memInfo.Buffers || 0,
+        cached: memInfo.Cached || 0,
+        swap_total: memInfo.SwapTotal || 0,
+        swap_free: memInfo.SwapFree || 0,
+        swap_used: memInfo.SwapTotal ? (memInfo.SwapTotal - memInfo.SwapFree) : 0,
+        swap_usage: memInfo.SwapTotal ? ((memInfo.SwapTotal - memInfo.SwapFree) / memInfo.SwapTotal * 100) : 0
+      });
+    });
+  });
+}
+
+// Replace diskusage with df command
+async function getDiskInfo() {
+  return new Promise((resolve) => {
+    exec('df / --output=size,used,avail | tail -n 1', (error, stdout) => {
+      if (error) {
+        console.error('Error getting disk info:', error);
+        resolve({
+          total: 0,
+          free: 0,
+          used: 0,
+          usage: 0
+        });
+        return;
+      }
+
+      try {
+        const parts = stdout.trim().split(/\s+/);
+        if (parts.length >= 3) {
+          const total = parseInt(parts[0]) * 1024; // Convert from KB to bytes
+          const used = parseInt(parts[1]) * 1024;
+          const free = parseInt(parts[2]) * 1024;
+
+          resolve({
+            total: total,
+            free: free,
+            used: used,
+            usage: total > 0 ? (used / total) * 100 : 0
+          });
+        } else {
+          resolve({
+            total: 0,
+            free: 0,
+            used: 0,
+            usage: 0
+          });
+        }
+      } catch (err) {
+        console.error('Error parsing disk info:', err);
+        resolve({
+          total: 0,
+          free: 0,
+          used: 0,
+          usage: 0
+        });
+      }
+    });
+  });
+}
+
+async function getDetailedDiskInfo() {
+  return new Promise((resolve) => {
+    exec('df -h', (error, stdout) => {
+      if (error) {
+        console.error(`Error getting detailed disk info: ${error}`);
+        resolve([]);
+        return;
+      }
+
+      try {
+        const lines = stdout.trim().split('\n').slice(1);
+        const disks = lines.map(line => {
+          const parts = line.trim().split(/\s+/);
+
+          let filesystem, size, used, available, use, mount;
+
+          if (parts.length >= 6) {
+            filesystem = parts[0];
+            size = parts[1];
+            used = parts[2];
+            available = parts[3];
+            use = parseInt(parts[4].replace('%', ''));
+            mount = parts[5];
+          } else {
+            filesystem = 'Unknown';
+            size = '0';
+            used = '0';
+            available = '0';
+            use = 0;
+            mount = 'Unknown';
+          }
+
+          const convertToBytes = (sizeStr) => {
+            const units = { 'K': 1024, 'M': 1024 ** 2, 'G': 1024 ** 3, 'T': 1024 ** 4 };
+            const match = sizeStr.match(/^([0-9.]+)([KMGT])?/i);
+            if (!match) return 0;
+            const num = parseFloat(match[1]);
+            const unit = match[2] && match[2].toUpperCase() ? match[2].toUpperCase() : '';
+            return num * (units[unit] || 1);
+          };
+
+          return {
+            fs: filesystem,
+            size: convertToBytes(size),
+            used: convertToBytes(used),
+            available: convertToBytes(available),
+            use,
+            mount
+          };
+        });
+
+        resolve(disks);
+      } catch (err) {
+        console.error('Error parsing disk info:', err);
+        resolve([]);
+      }
+    });
+  });
+}
+
+function getDiskIOStats() {
+  return new Promise((resolve) => {
+    exec('cat /proc/diskstats', (error, stdout) => {
+      if (error) {
+        console.error(`Error getting disk I/O stats: ${error}`);
+        resolve([]);
+        return;
+      }
+
+      try {
+        const lines = stdout.trim().split('\n');
+        const currentTime = Date.now();
+        const timeDiff = (currentTime - previousTimeStamp) / 1000;
+        const diskStats = [];
+
+        lines.forEach(line => {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length >= 14) {
+            const deviceName = parts[2];
+            if (!deviceName.startsWith('loop') &&
+              !deviceName.startsWith('ram') &&
+              !deviceName.startsWith('dm-')) {
+
+              const currentStats = {
+                device: deviceName,
+                reads_completed: parseInt(parts[3]),
+                reads_merged: parseInt(parts[4]),
+                sectors_read: parseInt(parts[5]),
+                time_reading_ms: parseInt(parts[6]),
+                writes_completed: parseInt(parts[7]),
+                writes_merged: parseInt(parts[8]),
+                sectors_written: parseInt(parts[9]),
+                time_writing_ms: parseInt(parts[10]),
+                io_in_progress: parseInt(parts[11]),
+                time_io_ms: parseInt(parts[12]),
+                weighted_time_io_ms: parseInt(parts[13])
+              };
+
+              if (previousDiskStats) {
+                const prevDeviceStats = previousDiskStats.find(d => d.device === deviceName);
+
+                if (prevDeviceStats && timeDiff > 0) {
+                  const sectorSize = 512;
+
+                  currentStats.read_rate_bytes_per_sec = ((currentStats.sectors_read - prevDeviceStats.sectors_read) * sectorSize) / timeDiff;
+                  currentStats.write_rate_bytes_per_sec = ((currentStats.sectors_written - prevDeviceStats.sectors_written) * sectorSize) / timeDiff;
+
+                  currentStats.read_rate_mb_per_sec = currentStats.read_rate_bytes_per_sec / (1024 * 1024);
+                  currentStats.write_rate_mb_per_sec = currentStats.write_rate_bytes_per_sec / (1024 * 1024);
+
+                  currentStats.io_rate = (
+                    (currentStats.reads_completed - prevDeviceStats.reads_completed) +
+                    (currentStats.writes_completed - prevDeviceStats.writes_completed)
+                  ) / timeDiff;
+                }
+              }
+
+              diskStats.push(currentStats);
+            }
+          }
+        });
+
+        previousDiskStats = diskStats;
+        previousTimeStamp = currentTime;
+
+        resolve(diskStats);
+      } catch (err) {
+        console.error('Error parsing disk I/O stats:', err);
+        resolve([]);
+      }
+    });
+  });
+}
+
+function getNetworkInfo() {
+  return new Promise((resolve) => {
+    exec('cat /proc/net/dev', (error, stdout) => {
+      if (error) {
+        console.error(`Error getting network stats: ${error}`);
+        resolve([]);
+        return;
+      }
+
+      try {
+        const lines = stdout.trim().split('\n').slice(2);
+        const currentTime = Date.now();
+        const interfaces = [];
+
+        lines.forEach(line => {
+          const parts = line.trim().split(/\s+/);
+          const interfaceName = parts[0].replace(':', '');
+
+          if (interfaceName !== 'lo') {
+            const currentStats = {
+              interface: interfaceName,
+              rx_bytes: parseInt(parts[1]),
+              rx_packets: parseInt(parts[2]),
+              rx_errors: parseInt(parts[3]),
+              rx_dropped: parseInt(parts[4]),
+              tx_bytes: parseInt(parts[9]),
+              tx_packets: parseInt(parts[10]),
+              tx_errors: parseInt(parts[11]),
+              tx_dropped: parseInt(parts[12])
+            };
+
+            if (previousNetworkData[interfaceName]) {
+              const timeDiff = (currentTime - previousNetworkData[interfaceName].timestamp) / 1000;
+
+              if (timeDiff > 0) {
+                currentStats.rx_bytes_per_sec = (currentStats.rx_bytes - previousNetworkData[interfaceName].rx_bytes) / timeDiff;
+                currentStats.tx_bytes_per_sec = (currentStats.tx_bytes - previousNetworkData[interfaceName].tx_bytes) / timeDiff;
+
+                currentStats.rx_mbps = currentStats.rx_bytes_per_sec * 8 / 1000000; // Convert to Mbps
+                currentStats.tx_mbps = currentStats.tx_bytes_per_sec * 8 / 1000000; // Convert to Mbps
+              }
+            }
+
+            previousNetworkData[interfaceName] = {
+              rx_bytes: currentStats.rx_bytes,
+              tx_bytes: currentStats.tx_bytes,
+              timestamp: currentTime
+            };
+
+            interfaces.push(currentStats);
+          }
+        });
+
+        resolve(interfaces);
+      } catch (err) {
+        console.error('Error parsing network stats:', err);
+        resolve([]);
+      }
+    });
+  });
+}
+
+function getProcessInfo() {
+  return new Promise((resolve) => {
+    exec('ps -eo state --no-header | sort | uniq -c', (error, stdout) => {
+      let processSummary = {
+        all: 0,
+        running: 0,
+        sleeping: 0,
+        stopped: 0,
+        zombie: 0,
+        other: 0
       };
+
+      if (!error) {
+        stdout.trim().split('\n').forEach(line => {
+          const [count, state] = line.trim().split(/\s+/);
+          const countNum = parseInt(count);
+
+          processSummary.all += countNum;
+
+          switch (state) {
+            case 'R':
+              processSummary.running += countNum;
+              break;
+            case 'S':
+            case 'I':
+              processSummary.sleeping += countNum;
+              break;
+            case 'T':
+              processSummary.stopped += countNum;
+              break;
+            case 'Z':
+              processSummary.zombie += countNum;
+              break;
+            case 'D':
+              processSummary.blocked = (processSummary.blocked || 0) + countNum;
+              break;
+            default:
+              processSummary.other += countNum;
+          }
+        });
+      }
+
+      exec('ps aux --sort=-%cpu | head -n 11', (error2, stdout2) => {
+        let topProcesses = [];
+
+        if (!error2) {
+          try {
+            const lines = stdout2.trim().split('\n').slice(1);
+            topProcesses = lines.map(line => {
+              const parts = line.trim().split(/\s+/);
+              const user = parts[0];
+              const pid = parseInt(parts[1]);
+              const cpu = parseFloat(parts[2]);
+              const mem = parseFloat(parts[3]);
+              const vsz = parseInt(parts[4]);
+              const rss = parseInt(parts[5]);
+              const tty = parts[6];
+              const stat = parts[7];
+              const start = parts[8];
+              const time = parts[9];
+              const command = parts.slice(10).join(' ');
+              const all = processSummary.all;
+
+              return {
+                user,
+                pid,
+                cpu,
+                mem,
+                vsz,
+                rss,
+                tty,
+                stat,
+                start,
+                time,
+                command: command.length > 50 ? command.substring(0, 47) + '...' : command,
+                all,
+              };
+            });
+          } catch (err) {
+            console.error('Error parsing process data:', err);
+          }
+        }
+
+        resolve({
+          ...processSummary,
+          top: topProcesses
+        });
+      });
+    });
+  });
+}
+
+function getUserInfo() {
+  return new Promise((resolve) => {
+    exec('who', (error, stdout) => {
+      if (error) {
+        console.error(`Error getting user info: ${error}`);
+        resolve([]);
+        return;
+      }
+
+      try {
+        const lines = stdout.trim().split('\n');
+        const users = lines.filter(line => line.trim() !== '').map(line => {
+          const parts = line.trim().split(/\s+/);
+          let user, tty, date, time, from;
+
+          if (parts.length >= 5) {
+            user = parts[0];
+            tty = parts[1];
+            date = parts[2];
+            time = parts[3];
+            from = parts[4].replace(/[\(\)]/g, '');
+          } else {
+            user = parts[0] || 'unknown';
+            tty = parts[1] || 'unknown';
+            date = parts[2] || '';
+            time = parts[3] || '';
+            from = 'local';
+          }
+
+          return { user, tty, date, time, ip: from !== 'local' ? from : null };
+        });
+
+        resolve(users);
+      } catch (err) {
+        console.error('Error parsing user data:', err);
+        resolve([]);
+      }
+    });
+  });
+}
+
+function getServicesInfo() {
+  return new Promise((resolve) => {
+    exec('systemctl list-units --type=service --state=active,running,failed --no-legend 2>/dev/null || echo ""',
+      (error, stdout) => {
+        if (error || !stdout.trim()) {
+          exec('service --status-all 2>&1', (err2, stdout2) => {
+            if (err2) {
+              console.error(`Error getting services info: ${err2}`);
+              resolve([]);
+              return;
+            }
+
+            try {
+              const lines = stdout2.trim().split('\n');
+              const services = lines.map(line => {
+                const match = line.trim().match(/\[\s*([+-?])\s*\]\s+(.+)$/);
+                if (!match) return null;
+
+                const status = match[1];
+                const name = match[2];
+
+                return {
+                  name,
+                  running: status === '+',
+                  cpu: null,
+                  mem: null
+                };
+              }).filter(service => service !== null);
+
+              resolve(services);
+            } catch (err) {
+              console.error('Error parsing service data:', err);
+              resolve([]);
+            }
+          });
+        } else {
+          try {
+            const lines = stdout.trim().split('\n');
+            const services = lines.filter(line => line.trim() !== '').map(line => {
+              const parts = line.trim().split(/\s+/);
+              let name = '';
+              let state = '';
+
+              if (parts.length >= 3) {
+                name = parts[0];
+                state = parts[2];
+              }
+
+              return {
+                name,
+                running: state === 'running',
+                cpu: null,
+                mem: null
+              };
+            });
+
+            if (services.length > 0) {
+              const serviceNames = services.map(s => s.name.replace('.service', '')).join('|');
+
+              exec(`ps -eo pid,pmem,pcpu,comm | grep -E '(${serviceNames})' | grep -v grep`,
+                (psErr, psOut) => {
+                  if (!psErr && psOut.trim()) {
+                    const psLines = psOut.trim().split('\n');
+
+                    psLines.forEach(psLine => {
+                      const [pid, mem, cpu, comm] = psLine.trim().split(/\s+/);
+
+                      const service = services.find(s =>
+                        comm.includes(s.name.replace('.service', ''))
+                      );
+
+                      if (service) {
+                        service.cpu = parseFloat(cpu);
+                        service.mem = parseFloat(mem);
+                      }
+                    });
+                  }
+
+                  resolve(services);
+                }
+              );
+            } else {
+              resolve(services);
+            }
+          } catch (err) {
+            console.error('Error parsing systemd service data:', err);
+            resolve([]);
+          }
+        }
+      }
+    );
+  });
+}
+
+function getSystemInfo() {
+  return new Promise((resolve) => {
+    const basicInfo = {
+      hostname: os.hostname(),
+      platform: os.platform(),
+      arch: os.arch(),
+      uptime: os.uptime(),
+      loadavg: os.loadavg(),
+      totalmem: os.totalmem(),
+      freemem: os.freemem()
+    };
+
+    exec('cat /etc/os-release 2>/dev/null || echo "ID=unknown\\nVERSION_ID=unknown"', (error, stdout) => {
+      let osInfo = {
+        distro: 'Unknown',
+        release: 'Unknown',
+        version: 'Unknown'
+      };
+
+      if (!error) {
+        const lines = stdout.trim().split('\n');
+        lines.forEach(line => {
+          const [key, ...valueParts] = line.split('=');
+          const value = valueParts.join('=').replace(/"/g, '');
+
+          if (key === 'ID') osInfo.distro = value;
+          if (key === 'VERSION_ID') osInfo.version = value;
+          if (key === 'PRETTY_NAME') osInfo.release = value;
+        });
+      }
+
+      exec('cat /proc/sys/fs/file-nr 2>/dev/null || echo "0 0 0"', (fileErr, fileOut) => {
+        let fileStats = {};
+
+        if (!fileErr) {
+          const [allocated, _, max] = fileOut.trim().split(/\s+/);
+          fileStats = {
+            open_files: parseInt(allocated),
+            max_files: parseInt(max),
+            file_usage_percent: (parseInt(allocated) / parseInt(max) * 100).toFixed(2)
+          };
+        }
+
+        const commands = [
+          'cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "Unknown"',
+          'cat /sys/class/dmi/id/product_name 2>/dev/null || echo "Unknown"',
+          'cat /sys/class/dmi/id/product_version 2>/dev/null || echo "Unknown"',
+          'uname -r'
+        ];
+
+        Promise.all(commands.map(cmd => new Promise((resolve) =>
+          exec(cmd, (err, out) => resolve(err ? 'Unknown' : out.trim()))
+        ))).then(([manufacturer, model, version, kernel]) => {
+          resolve({
+            ...basicInfo,
+            ...osInfo,
+            ...fileStats,
+            manufacturer,
+            model,
+            version,
+            kernel
+          });
+        });
+      });
+    });
+  });
+}
+
+function getVersionsInfo() {
+  return new Promise((resolve) => {
+    const commands = {
+      node: 'node -v 2>/dev/null || echo "N/A"',
+      npm: 'npm -v 2>/dev/null || echo "N/A"',
+      kernel: 'uname -r 2>/dev/null || echo "N/A"',
+      openssl: 'openssl version 2>/dev/null || echo "N/A"',
+      php: 'php -v 2>/dev/null | head -n 1 || echo "N/A"',
+      mysql: 'mysql --version 2>/dev/null || echo "N/A"',
+      apache: 'apache2 -v 2>/dev/null || httpd -v 2>/dev/null || echo "N/A"',
+      nginx: 'nginx -v 2>&1 || echo "N/A"'
+    };
+
+    const versions = {};
+    const promises = [];
+
+    for (const [key, cmd] of Object.entries(commands)) {
+      promises.push(
+        new Promise((resolve) => {
+          exec(cmd, (err, out) => {
+            let version = err ? 'N/A' : out.trim();
+
+            if (key === 'openssl') {
+              const match = version.match(/OpenSSL\s+(\S+)/i);
+              version = match ? match[1] : version;
+              if (version.includes('quic')) {
+                const parts = version.split('+');
+                if (parts.length > 1) {
+                  version = parts[0] + '+quic';
+                }
+              }
+            } else if (key === 'php') {
+              const match = version.match(/PHP\s+(\S+)/);
+              version = match ? match[1] : version;
+            } else if (key === 'mysql') {
+              const match = version.match(/Distrib\s+(\S+)/);
+              version = match ? match[1] : version;
+            } else if (key === 'apache') {
+              const match = version.match(/version:?\s+Apache\/(\S+)/i);
+              version = match ? match[1] : version;
+            } else if (key === 'nginx') {
+              const match = version.match(/nginx\/(\S+)/);
+              version = match ? match[1] : version;
+            }
+
+            if (version !== 'N/A') {
+              versions[key] = version;
+            }
+            resolve();
+          });
+        })
+      );
     }
 
-    // For full sysinfo, collect all data
+    Promise.all(promises).then(() => resolve(versions));
+  });
+}
+
+async function gatherSystemData() {
+  try {
     const [
-      system,
-      cpu,
-      cpuTemp,
-      cpuCurrentSpeed,
-      cpuFlags,
-      mem,
-      memLayout,
-      osInfo,
-      currentLoad,
-      fullLoad,
-      processes,
-      processLoad,
-      services,
-      disk,
-      blockDevices,
-      fsSize,
-      disksIO,
-      networkInterfaces,
-      networkStats,
-      networkConnections,
-      inetLatency,
-      users,
-      versions,
-      time,
-      fileSystemStats,
-      chassis
+      cpuDetailedInfo,
+      memoryDetailedInfo,
+      diskInfo,
+      diskIOStats,
+      detailedDiskInfo,
+      networkInfo,
+      processInfo,
+      userInfo,
+      servicesInfo,
+      systemInfo,
+      versionsInfo
     ] = await Promise.all([
-      si.system(),
-      si.cpu(),
-      si.cpuTemperature(),
-      si.cpuCurrentSpeed(),
-      si.cpuFlags(),
-      si.mem(),
-      si.memLayout(),
-      si.osInfo(),
-      si.currentLoad(),
-      si.fullLoad(),
-      si.processes(),
-      si.processLoad('*'),
-      si.services('*'),
-      si.diskLayout(),
-      si.blockDevices(),
-      si.fsSize(),
-      si.disksIO(),
-      si.networkInterfaces(),
-      si.networkStats(),
-      si.networkConnections(),
-      si.inetLatency(),
-      si.users(),
-      si.versions(),
-      si.time(),
-      si.fsStats(),
-      si.chassis()
+      getDetailedCpuInfo(),
+      getDetailedMemoryInfo(),
+      getDiskInfo(),
+      getDiskIOStats(),
+      getDetailedDiskInfo(),
+      getNetworkInfo(),
+      getProcessInfo(),
+      getUserInfo(),
+      getServicesInfo(),
+      getSystemInfo(),
+      getVersionsInfo()
     ]);
 
-    // Get additional thermal data (Linux-specific)
-    let thermalData = {
-      thermalZones: 0,
-      fanSpeed: 'N/A',
-      zoneTemps: []
-    };
+    const cpuInfo = getCpuInfo();
+    const memoryInfo = getMemoryInfo();
 
-    try {
-      // Read thermal zone data on Linux systems
-      if (osInfo.platform === 'linux') {
-        // Get thermal zone count and temperatures
-        const { stdout: thermalOutput } = await execPromise('ls -1 /sys/class/thermal/ | grep thermal_zone | wc -l');
-        thermalData.thermalZones = parseInt(thermalOutput.trim()) || 0;
-        
-        if (thermalData.thermalZones > 0) {
-          const { stdout: tempOutput } = await execPromise('cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null || echo "N/A"');
-          thermalData.zoneTemps = tempOutput.trim().split('\n')
-            .map(t => parseInt(t) / 1000)
-            .filter(t => !isNaN(t));
-        }
-        
-        // Try to get fan speed - this is very hardware dependent
-        try {
-          const { stdout: fanOutput } = await execPromise('cat /sys/class/hwmon/*/fan*_input 2>/dev/null || echo "N/A"');
-          if (fanOutput && fanOutput.trim() !== 'N/A') {
-            const fanSpeed = parseInt(fanOutput.trim());
-            thermalData.fanSpeed = isNaN(fanSpeed) ? 'N/A' : fanSpeed + ' RPM';
-          } else {
-            // Alternative method via lm-sensors if installed
-            const { stdout: sensorsOutput } = await execPromise('sensors 2>/dev/null | grep fan | head -n 1 || echo "N/A"');
-            if (sensorsOutput && sensorsOutput.trim() !== 'N/A') {
-              const match = sensorsOutput.match(/(\d+)\s*RPM/);
-              thermalData.fanSpeed = match ? match[1] + ' RPM' : 'N/A';
-            }
-          }
-        } catch (fanErr) {
-          // Fan speed reading failed, keep default 'N/A'
-        }
-      } else if (osInfo.platform === 'darwin') {
-        // macOS-specific temperature monitoring
-        try {
-          const { stdout: smmOutput } = await execPromise('sudo smckit -k "TC0P" 2>/dev/null || echo "N/A"');
-          if (smmOutput && smmOutput.trim() !== 'N/A') {
-            const match = smmOutput.match(/(\d+\.\d+)/);
-            if (match) {
-              cpuTemp.main = parseFloat(match[1]);
-            }
-          }
-        } catch (macTempErr) {
-          // macOS temp reading failed, keep values from si.cpuTemperature()
-        }
-      } else if (osInfo.platform === 'win32') {
-        // Windows-specific monitoring could be added here
-        // Most data should already be available through si.cpuTemperature()
-      }
-    } catch (thermalErr) {
-      console.error('Error getting thermal data:', thermalErr);
-      // Keep default values
-    }
-
-    // Calculate CPU usage and load
-    const cpuUsage = currentLoad.currentLoad;
-    const cpuLoadPerCore = currentLoad.cpus.map(cpu => cpu.load);
-    
-    // Get CPU temperature - if main is null, try to use average of cores or thermal zone data
-    let cpuTemperature = cpuTemp.main;
-    if (cpuTemperature === null || cpuTemperature === 0) {
-      if (cpuTemp.cores && cpuTemp.cores.length > 0) {
-        // Try to use average of core temperatures
-        const validCoreTemps = cpuTemp.cores.filter(t => t !== null && t > 0);
-        if (validCoreTemps.length > 0) {
-          cpuTemperature = validCoreTemps.reduce((sum, t) => sum + t, 0) / validCoreTemps.length;
-        }
-      }
-      
-      // If still null, try thermal zone temps
-      if ((cpuTemperature === null || cpuTemperature === 0) && thermalData.zoneTemps.length > 0) {
-        cpuTemperature = thermalData.zoneTemps[0]; // Use first thermal zone as CPU temp
-      }
-    }
-
-    // Get CPU frequency
-    let cpuFrequency = cpuCurrentSpeed.avg;
-    if (cpuFrequency === 0 || cpuFrequency === null) {
-      // If avg is not available, try to use the max of core speeds
-      if (cpuCurrentSpeed.cores && cpuCurrentSpeed.cores.length > 0) {
-        const validCoreSpeeds = cpuCurrentSpeed.cores.filter(s => s !== null && s > 0);
-        if (validCoreSpeeds.length > 0) {
-          cpuFrequency = Math.max(...validCoreSpeeds);
-        }
-      }
-      
-      // If still not available, try to get it from CPU model string
-      if ((cpuFrequency === 0 || cpuFrequency === null) && cpu.brand) {
-        const matchFreq = cpu.brand.match(/(\d+\.\d+)GHz/);
-        if (matchFreq) {
-          cpuFrequency = parseFloat(matchFreq[1]);
-        }
-      }
-    }
-
-    // Get process information
-    const topProcesses = processes.list
-      .sort((a, b) => b.cpu - a.cpu)
-      .slice(0, 10)
-      .map(p => ({
-        pid: p.pid,
-        user: p.user || 'unknown',
-        name: p.name,
-        cpu: p.cpu,
-        mem: p.mem,
-        vsz: p.memVsz || 0,
-        rss: p.memRss || 0,
-        tty: p.tty || '',
-        stat: p.state || '',
-        start: p.started || '',
-        time: p.time || '',
-        command: p.command || p.name
-      }));
-
-    // Get service information
-    const allServices = services.map(s => ({
-      name: s.name,
-      running: s.running,
-      cpu: s.cpu !== undefined ? s.cpu : null,
-      mem: s.mem !== undefined ? s.mem : null
-    }));
-
-    // Format disk IO stats
-    const diskIOStats = Object.keys(disksIO.rIO_sec || {}).map(device => {
-      const readRate = disksIO.rIO_sec[device] || 0;
-      const writeRate = disksIO.wIO_sec[device] || 0;
-      const readBytes = disksIO.rBytes_sec[device] || 0;
-      const writeBytes = disksIO.wBytes_sec[device] || 0;
-
-      return {
-        device,
-        reads_completed: disksIO.rIO[device] || 0,
-        writes_completed: disksIO.wIO[device] || 0,
-        read_rate_bytes_per_sec: readBytes,
-        write_rate_bytes_per_sec: writeBytes,
-        read_rate_mb_per_sec: readBytes / (1024 * 1024),
-        write_rate_mb_per_sec: writeBytes / (1024 * 1024),
-        io_rate: readRate + writeRate
-      };
-    });
-
-    // Format detailed storage information
-    const detailedStorage = fsSize.map(fs => {
-      return {
-        fs: fs.fs,
-        type: fs.type,
-        size: fs.size,
-        used: fs.used,
-        available: fs.size - fs.used,
-        use: fs.use,
-        mount: fs.mount
-      };
-    });
-
-    // Format network interface statistics
-    const formattedNetworkStats = networkStats.map(intf => {
-      return {
-        interface: intf.iface,
-        rx_bytes: intf.rx_bytes,
-        rx_packets: intf.rx_packets,
-        rx_errors: intf.rx_errors,
-        rx_dropped: intf.rx_dropped,
-        tx_bytes: intf.tx_bytes,
-        tx_packets: intf.tx_packets,
-        tx_errors: intf.tx_errors,
-        tx_dropped: intf.tx_dropped,
-        rx_bytes_per_sec: intf.rx_sec,
-        tx_bytes_per_sec: intf.tx_sec,
-        rx_mbps: (intf.rx_sec * 8) / 1000000,
-        tx_mbps: (intf.tx_sec * 8) / 1000000
-      };
-    });
-
-    // Calculate swap information
-    const swapTotal = mem.swaptotal || 0;
-    const swapUsed = mem.swapused || 0;
-    const swapFree = mem.swapfree || 0;
-    const swapPercentage = swapTotal > 0 ? (swapUsed / swapTotal) * 100 : 0;
-
-    // Get file descriptor information
-    const fileDescriptors = {
-      open_files: fileSystemStats.openFiles,
-      max_files: fileSystemStats.maxFiles,
-      file_usage_percent: fileSystemStats.maxFiles > 0 
-        ? (fileSystemStats.openFiles / fileSystemStats.maxFiles * 100).toFixed(2)
-        : 0
-    };
-
-    // Format and return the complete system data
     return {
       timestamp: Date.now(),
       cpu: {
-        manufacturer: cpu.manufacturer,
-        brand: cpu.brand,
-        model: cpu.brand,
-        cores: cpu.cores,
-        physicalCores: cpu.physicalCores,
-        speed: cpuFrequency,
-        usage: cpuUsage,
-        load_1min: currentLoad.avgLoad,
-        load_5min: currentLoad.avgLoad5min || 0,
-        load_15min: currentLoad.avgLoad15min || 0,
-        temperature: cpuTemperature,
-        frequency: cpuFrequency,
-        coreLoad: cpuLoadPerCore,
-        flags: cpuFlags
+        ...cpuInfo,
+        ...cpuDetailedInfo
       },
       memory: {
-        total: mem.total,
-        free: mem.free,
-        used: mem.used,
-        active: mem.active,
-        available: mem.available,
-        usage: (mem.used / mem.total) * 100,
-        buffers: mem.buffers || 0,
-        cached: mem.cached || 0,
-        swap_total: swapTotal,
-        swap_free: swapFree,
-        swap_used: swapUsed,
-        swap_usage: swapPercentage
+        ...memoryInfo,
+        ...memoryDetailedInfo
       },
-      disk: {
-        total: fsSize.reduce((total, fs) => total + fs.size, 0),
-        free: fsSize.reduce((total, fs) => total + (fs.size - fs.used), 0),
-        used: fsSize.reduce((total, fs) => total + fs.used, 0),
-        usage: fsSize.length > 0 
-          ? (fsSize.reduce((total, fs) => total + fs.used, 0) / fsSize.reduce((total, fs) => total + fs.size, 0)) * 100 
-          : 0
-      },
+      disk: diskInfo,
       disk_io: diskIOStats,
-      storage: detailedStorage,
-      network: formattedNetworkStats,
-      processes: {
-        all: processes.all,
-        running: processes.running,
-        blocked: processes.blocked,
-        sleeping: processes.sleeping,
-        stopped: processes.stopped || 0,
-        zombie: processes.zombie || 0,
-        unknown: processes.unknown || 0,
-        top: topProcesses
-      },
-      users: users,
-      services: allServices,
-      os: {
-        hostname: osInfo.hostname,
-        platform: osInfo.platform,
-        distro: osInfo.distro,
-        release: osInfo.release,
-        codename: osInfo.codename,
-        kernel: osInfo.kernel,
-        arch: osInfo.arch,
-        uptime: time.uptime,
-        loadavg: [currentLoad.avgLoad, currentLoad.avgLoad5min || 0, currentLoad.avgLoad15min || 0],
-        totalmem: mem.total,
-        freemem: mem.free,
-        ...fileDescriptors,
-        manufacturer: system.manufacturer,
-        model: system.model,
-        version: system.version
-      },
+      storage: detailedDiskInfo,
+      network: networkInfo,
+      processes: processInfo,
+      users: userInfo,
+      services: servicesInfo,
+      os: systemInfo,
       system: {
-        manufacturer: system.manufacturer,
-        model: system.model,
-        version: system.version
+        manufacturer: systemInfo.manufacturer,
+        model: systemInfo.model,
+        version: systemInfo.version
       },
-      versions: {
-        kernel: versions.kernel,
-        openssl: versions.openssl,
-        node: versions.node,
-        npm: versions.npm,
-        php: versions.php,
-        mysql: versions.mysql,
-        apache: versions.apache,
-        nginx: versions.nginx,
-        yarn: versions.yarn,
-        pm2: versions.pm2,
-        docker: versions.docker,
-        redis: versions.redis,
-        postgresql: versions.postgresql,
-      },
-      time: time.uptime,
-      thermal: {
-        cpuTemperature: cpuTemperature,
-        cpuFrequency: cpuFrequency,
-        fanSpeed: thermalData.fanSpeed,
-        thermalZones: thermalData.thermalZones,
-        zoneTemperatures: thermalData.zoneTemps
-      }
+      versions: versionsInfo,
+      time: systemInfo.uptime
     };
   } catch (error) {
     console.error('Error gathering system data:', error);
-    throw error;
+
+    return {
+      timestamp: Date.now(),
+      cpu: getCpuInfo(),
+      memory: getMemoryInfo(),
+      error: error.message
+    };
   }
 }
 
 module.exports = {
-  getSystemInfo
+  gatherSystemData
 };

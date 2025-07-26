@@ -5,29 +5,30 @@ const { combine, timestamp, printf, colorize, json } = format;
 const DailyRotateFile = require('winston-daily-rotate-file');
 const WebSocket = require('ws');
 
-const logsDir = path.join('/var/www/siroum_ci4/websocket', 'writable', 'logs');
+// Use current working directory instead of hardcoded path
+const logsDir = path.join(process.cwd(), 'writable', 'logs');
 if (!fs.existsSync(logsDir)) {
     fs.mkdirSync(logsDir, { recursive: true });
 }
 
 const consoleFormat = printf(({ level, message, timestamp, ...metadata }) => {
     let msg = `${timestamp} [${level}]: ${message}`;
-        if (Object.keys(metadata).length > 0) {
-            msg += '\n' + logStringify(metadata);
-        }
+    if (Object.keys(metadata).length > 0) {
+        msg += '\n' + logStringify(metadata);
+    }
     return msg;
 });
 
 function logStringify(obj, replacer = null, space = 2) {
     const seen = new WeakSet();
-        return JSON.stringify(obj, function(key, value) {
-            if (typeof value === 'object' && value !== null) {
-                if (seen.has(value)) {
-                    return '[Circular]';
-                }
-                seen.add(value);
+    return JSON.stringify(obj, function (key, value) {
+        if (typeof value === 'object' && value !== null) {
+            if (seen.has(value)) {
+                return '[Circular]';
             }
-            return replacer ? replacer.call(this, key, value) : value;
+            seen.add(value);
+        }
+        return replacer ? replacer.call(this, key, value) : value;
     }, space);
 }
 
@@ -39,69 +40,69 @@ const logger = createLogger({
     ),
     transports: [
         ...(process.env.NODE_ENV !== 'production' ? [
-        new transports.Console({
-            format: combine(colorize(), consoleFormat)
-        })
+            new transports.Console({
+                format: combine(colorize(), consoleFormat)
+            })
         ] : []),
         new DailyRotateFile({
-        filename: path.join(logsDir, 'error-%DATE%.log'),
-        datePattern: 'YYYY-MM-DD',
-        level: 'error',
-        maxSize: '20m',
-        maxFiles: '14d',
-        createSymlink: true,
-        symlinkName: 'error.log'
+            filename: path.join(logsDir, 'error-%DATE%.log'),
+            datePattern: 'YYYY-MM-DD',
+            level: 'error',
+            maxSize: '20m',
+            maxFiles: '14d',
+            createSymlink: true,
+            symlinkName: 'error.log'
         }),
         new DailyRotateFile({
-        filename: path.join(logsDir, 'warning-%DATE%.log'),
-        datePattern: 'YYYY-MM-DD',
-        level: 'warn',
-        maxSize: '20m',
-        maxFiles: '14d',
-        createSymlink: true,
-        symlinkName: 'warning.log'
+            filename: path.join(logsDir, 'warning-%DATE%.log'),
+            datePattern: 'YYYY-MM-DD',
+            level: 'warn',
+            maxSize: '20m',
+            maxFiles: '14d',
+            createSymlink: true,
+            symlinkName: 'warning.log'
         }),
         new DailyRotateFile({
-        filename: path.join(logsDir, 'info-%DATE%.log'),
-        datePattern: 'YYYY-MM-DD',
-        level: 'info',
-        maxSize: '20m',
-        maxFiles: '14d',
-        createSymlink: true,
-        symlinkName: 'info.log'
+            filename: path.join(logsDir, 'info-%DATE%.log'),
+            datePattern: 'YYYY-MM-DD',
+            level: 'info',
+            maxSize: '20m',
+            maxFiles: '14d',
+            createSymlink: true,
+            symlinkName: 'info.log'
         }),
         new DailyRotateFile({
-        filename: path.join(logsDir, 'debug-%DATE%.log'),
-        datePattern: 'YYYY-MM-DD',
-        level: 'debug',
-        maxSize: '20m',
-        maxFiles: '14d',
-        createSymlink: true,
-        symlinkName: 'debug.log'
+            filename: path.join(logsDir, 'debug-%DATE%.log'),
+            datePattern: 'YYYY-MM-DD',
+            level: 'debug',
+            maxSize: '20m',
+            maxFiles: '14d',
+            createSymlink: true,
+            symlinkName: 'debug.log'
         }),
         new DailyRotateFile({
-        filename: path.join(logsDir, 'combined-%DATE%.log'),
-        datePattern: 'YYYY-MM-DD',
-        maxSize: '20m',
-        maxFiles: '14d',
-        createSymlink: true,
-        symlinkName: 'combined.log'
+            filename: path.join(logsDir, 'combined-%DATE%.log'),
+            datePattern: 'YYYY-MM-DD',
+            maxSize: '20m',
+            maxFiles: '14d',
+            createSymlink: true,
+            symlinkName: 'combined.log'
         }),
         new DailyRotateFile({
-        filename: path.join(logsDir, 'requests-%DATE%.log'),
-        datePattern: 'YYYY-MM-DD',
-        maxSize: '20m',
-        maxFiles: '14d',
-        createSymlink: true,
-        symlinkName: 'requests.log'
+            filename: path.join(logsDir, 'requests-%DATE%.log'),
+            datePattern: 'YYYY-MM-DD',
+            maxSize: '20m',
+            maxFiles: '14d',
+            createSymlink: true,
+            symlinkName: 'requests.log'
         })
     ]
 });
 
 const requestMetrics = {
-  totalRequests: 0,
-  requestsPerMinute: 0,
-  lastMinuteRequests: []
+    totalRequests: 0,
+    requestsPerMinute: 0,
+    lastMinuteRequests: []
 };
 
 const MAX_ERROR_LOGS = 100;
@@ -117,23 +118,23 @@ class AuthenticationError extends Error {
 }
 
 function logWebRequest(req) {
-  requestMetrics.totalRequests++;
-  requestMetrics.lastMinuteRequests.push(Date.now());
-  updateRequestMetrics();
+    requestMetrics.totalRequests++;
+    requestMetrics.lastMinuteRequests.push(Date.now());
+    updateRequestMetrics();
 
-  logger.info('Web request', {
-    method: req.method,
-    url: req.url,
-    ip: req.ip,
-    userAgent: req.headers['user-agent']
-  });
+    logger.info('Web request', {
+        method: req.method,
+        url: req.url,
+        ip: req.ip,
+        userAgent: req.headers['user-agent']
+    });
 }
 
 function updateRequestMetrics() {
-  const now = Date.now();
-  const oneMinuteAgo = now - 60000;
-  requestMetrics.lastMinuteRequests = requestMetrics.lastMinuteRequests.filter(time => time > oneMinuteAgo);
-  requestMetrics.requestsPerMinute = requestMetrics.lastMinuteRequests.length;
+    const now = Date.now();
+    const oneMinuteAgo = now - 60000;
+    requestMetrics.lastMinuteRequests = requestMetrics.lastMinuteRequests.filter(time => time > oneMinuteAgo);
+    requestMetrics.requestsPerMinute = requestMetrics.lastMinuteRequests.length;
 }
 
 function logServerError(error, req = null) {
@@ -142,10 +143,10 @@ function logServerError(error, req = null) {
         message: error.message,
         stack: error.stack,
         request: req ? {
-        method: req.method,
-        url: req.url,
-        ip: req.ip,
-        userAgent: req.headers['user-agent']
+            method: req.method,
+            url: req.url,
+            ip: req.ip,
+            userAgent: req.headers['user-agent']
         } : null
     };
 
@@ -170,66 +171,66 @@ function setupErrorHandlers(server = null, wss = null) {
 
     if (wss) {
         wss.on('error', (error) => {
-        logServerError(error);
-        logger.error('WebSocket Server Error', { error: error.message, stack: error.stack });
+            logServerError(error);
+            logger.error('WebSocket Server Error', { error: error.message, stack: error.stack });
         });
     }
 
     ['SIGINT', 'SIGTERM', 'SIGQUIT'].forEach(signal => {
         process.on(signal, () => {
-        logger.info(`${signal} received. Shutting down.`);
-        
-        const closeHttpServer = server ? new Promise((resolve) => {
-            server.close(() => {
-            logger.info('HTTP server closed.');
-            resolve();
-            });
-        }) : Promise.resolve();
+            logger.info(`${signal} received. Shutting down.`);
 
-        const closeWsServer = wss ? new Promise((resolve) => {
-            wss.close(() => {
-            logger.info('WebSocket server closed.');
-            resolve();
-            });
-        }) : Promise.resolve();
+            const closeHttpServer = server ? new Promise((resolve) => {
+                server.close(() => {
+                    logger.info('HTTP server closed.');
+                    resolve();
+                });
+            }) : Promise.resolve();
 
-        Promise.all([closeHttpServer, closeWsServer]).then(() => {
-            logger.info('All servers closed. Exiting process.');
-            process.exit(0);
-        });
+            const closeWsServer = wss ? new Promise((resolve) => {
+                wss.close(() => {
+                    logger.info('WebSocket server closed.');
+                    resolve();
+                });
+            }) : Promise.resolve();
+
+            Promise.all([closeHttpServer, closeWsServer]).then(() => {
+                logger.info('All servers closed. Exiting process.');
+                process.exit(0);
+            });
         });
     });
 }
 
 function getErrorLogs(limit = 10) {
-  return errorLogs.slice(-limit);
+    return errorLogs.slice(-limit);
 }
 
 function getRequestMetrics() {
-  return { ...requestMetrics };
+    return { ...requestMetrics };
 }
 
 function logInfo(message, metadata = {}) {
-  logger.info(message, metadata);
+    logger.info(message, metadata);
 }
 
 function logWarning(message, metadata = {}) {
-  logger.warn(message, metadata);
+    logger.warn(message, metadata);
 }
 
 function logDebug(message, metadata = {}) {
-  logger.debug(message, metadata);
+    logger.debug(message, metadata);
 }
 
 function logError(message, metadata = {}) {
-  logger.error(message, metadata);
+    logger.error(message, metadata);
 }
 
 function errorMiddleware(err, req, res, next) {
     logServerError(err, req);
 
-    res.status(500).json({ 
-        error: 'Something went wrong. Please try again later.' 
+    res.status(500).json({
+        error: 'Something went wrong. Please try again later.'
     });
 }
 
