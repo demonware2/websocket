@@ -36,7 +36,7 @@ async function initDatabase() {
 
 async function loadSettings(secret_whatsapp) {
     try {
-        let keyRedis = `whatsapp_bot_key_2:${secret_whatsapp}`;
+        let keyRedis = `whatsapp_bot_key:${secret_whatsapp}`;
         let settings = await redis.hgetall(keyRedis);
 
         if (Object.keys(settings).length === 0) {
