@@ -1,22 +1,18 @@
 require('dotenv').config();
 const http = require('http');
 const WebSocket = require('ws');
-const jwt = require('jsonwebtoken');
 const mysql = require('mysql2/promise');
 const Redis = require('ioredis');
 const { v4: uuidv4 } = require('uuid');
 
-// Configuration
-const PORT = parseInt(process.env.PORT) || 9950;
-const JWT_SECRET = process.env.JWT_SECRET;
-const ALLOWED_ORIGINS = [
-    'https://172.18.177.22',
-    'https://172.29.3.178',
-    'http://localhost',
-    'http://127.0.0.1'
-];
+const { verifyAuthentication, removeConnection } = require('./app/Helper/authMiddleware');
+const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
+const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
+const { handleChat } = require('./app/Function/chatHandler');
+const { handleWhatsapp } = require('./app/Function/whatsappHandler');
 
-// Database connection
+const PORT = parseInt(process.env.PORT) || 9950;
+
 const dbConfig = {
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'root',
@@ -27,7 +23,6 @@ const dbConfig = {
     timeout: 60000
 };
 
-// Redis connection
 const redis = new Redis({
     host: process.env.REDIS_HOST || '127.0.0.1',
     port: process.env.REDIS_PORT || 6379,
@@ -37,72 +32,21 @@ const redis = new Redis({
     lazyConnect: true
 });
 
-// Import original functions
-const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
-const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
-const { handleChat } = require('./app/Function/chatHandler');
-const { handleWhatsapp } = require('./app/Function/whatsappHandler');
-
-// Active connections
 const connections = new Map();
-const editorSessions = new Map();
 
-// Safe logging function
 function safeLog(level, message, data = {}) {
     const timestamp = new Date().toISOString();
     const logData = typeof data === 'object' ? JSON.stringify(data, null, 2) : data;
     console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`, logData);
 }
 
-// Safe error handling - never throw, never crash
 function handleError(error, context = 'Unknown') {
     safeLog('error', `Error in ${context}:`, {
         message: error.message || 'Unknown error',
         stack: error.stack || 'No stack trace'
     });
-    // Never throw, never exit, just log
 }
 
-// Authentication function
-async function authenticateUser(token, path) {
-    try {
-        if (!token || !JWT_SECRET) {
-            return null;
-        }
-
-        const decoded = jwt.verify(token, JWT_SECRET);
-        
-        if (!decoded.userId || decoded.type !== 'ws') {
-            return null;
-        }
-
-        // Simple role check - all authenticated users can access editor
-        if (path.startsWith('/editor/')) {
-            return {
-                userId: decoded.userId,
-                roleId: decoded.roleId || 1,
-                name: decoded.name || `User${decoded.userId}`
-            };
-        }
-
-        // For other paths, check specific permissions
-        const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat'];
-        if (allowedPaths.includes(path)) {
-            return {
-                userId: decoded.userId,
-                roleId: decoded.roleId || 1,
-                name: decoded.name || `User${decoded.userId}`
-            };
-        }
-
-        return null;
-    } catch (error) {
-        handleError(error, 'Authentication');
-        return null;
-    }
-}
-
-// Database functions
 async function getEditorContent(rppId) {
     try {
         const connection = await mysql.createConnection(dbConfig);
@@ -140,7 +84,6 @@ async function saveEditorContent(rppId, content, userId) {
     }
 }
 
-// Editor handler
 class EditorHandler {
     constructor() {
         this.clients = new Map();
@@ -158,7 +101,6 @@ class EditorHandler {
         });
 
         try {
-            // Get editor content from Redis or database
             const cachedContent = await redis.get(`editor:${rppId}:content`);
             let editorData;
             
@@ -172,12 +114,9 @@ class EditorHandler {
                     timestamp: Date.now(),
                     version: 1
                 };
-                
-                // Cache it
                 await redis.setex(`editor:${rppId}:content`, 1800, JSON.stringify(editorData));
             }
 
-            // Send initial data
             this.safeSend(ws, {
                 type: 'editor_init',
                 data: editorData,
@@ -368,7 +307,7 @@ class EditorHandler {
             } catch (error) {
                 handleError(error, 'EditorHandler.startPeriodicSync');
             }
-        }, 300000); // Sync every 5 minutes
+        }, 300000);
     }
 
     async syncToDatabase(rppId) {
@@ -393,36 +332,21 @@ class EditorHandler {
     }
 }
 
-// Create editor handler instance
 const editorHandler = new EditorHandler();
-
-// Create HTTP server
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('WebSocket Server is running\n');
 });
 
-// Create WebSocket server
 const wss = new WebSocket.Server({ noServer: true });
 
-// Handle WebSocket upgrade
 server.on('upgrade', async (request, socket, head) => {
     try {
         safeLog('info', `WebSocket upgrade request from ${socket.remoteAddress} to ${request.url}`);
         
         const url = new URL(request.url, `http://${request.headers.host}`);
-        const token = url.searchParams.get('token');
-        const origin = request.headers.origin;
-        
-        // Check origin
-        if (origin && !ALLOWED_ORIGINS.some(allowed => origin.startsWith(allowed))) {
-            safeLog('warn', `Invalid origin: ${origin}`);
-            socket.destroy();
-            return;
-        }
-        
-        // Clean path
         let pathname = url.pathname;
+        
         if (pathname.startsWith('/websocket')) {
             pathname = pathname.replace(/^\/websocket/, '');
         }
@@ -433,8 +357,7 @@ server.on('upgrade', async (request, socket, head) => {
             pathname = '/';
         }
 
-        // Authenticate
-        const user = await authenticateUser(token, pathname);
+        const user = await verifyAuthentication(request, pathname, 'ws', 'ws');
         if (!user) {
             safeLog('warn', `Authentication failed for path: ${pathname}`);
             socket.destroy();
@@ -443,7 +366,6 @@ server.on('upgrade', async (request, socket, head) => {
 
         safeLog('info', `Authentication successful for user: ${user.userId}`);
 
-        // Handle upgrade
         wss.handleUpgrade(request, socket, head, (ws) => {
             handleConnection(ws, user, pathname, request);
         });
@@ -458,7 +380,6 @@ server.on('upgrade', async (request, socket, head) => {
     }
 });
 
-// Handle WebSocket connections
 function handleConnection(ws, user, pathname, request) {
     try {
         safeLog('info', `WebSocket connection established for ${user.userId} on ${pathname}`);
@@ -466,7 +387,6 @@ function handleConnection(ws, user, pathname, request) {
         const connectionId = uuidv4();
         connections.set(connectionId, { ws, user, pathname, lastActivity: Date.now(), request });
 
-        // Handle different routes
         if (pathname.startsWith('/editor/')) {
             const rppId = pathname.split('/')[2];
             if (rppId) {
@@ -479,7 +399,6 @@ function handleConnection(ws, user, pathname, request) {
             handleOtherConnections(ws, user, pathname, connectionId, request);
         }
 
-        // Handle disconnection
         ws.on('close', () => {
             handleDisconnection(connectionId);
         });
@@ -513,7 +432,6 @@ async function handleEditorConnection(ws, user, rppId, connectionId) {
                 }
             });
             
-            // Store client ID for cleanup
             const connection = connections.get(connectionId);
             if (connection) {
                 connection.clientId = clientId;
@@ -551,7 +469,6 @@ function handleOtherConnections(ws, user, pathname, connectionId, request) {
     }
 }
 
-// Original WebSocket handlers
 function handleSystemInfo(ws, user, connectionId, request) {
     try {
         const url = new URL(request.url, `http://${request.headers.host}`);
@@ -574,10 +491,7 @@ function handleSystemInfo(ws, user, connectionId, request) {
             }
         };
 
-        // Send initial data
         getSystemInfoHandler();
-        
-        // Set up interval
         intervalId = setInterval(getSystemInfoHandler, 5000);
 
         ws.on('close', () => {
@@ -626,10 +540,7 @@ function handlePM2Data(ws, user, connectionId, request) {
             }
         };
 
-        // Send initial data
         sendPM2Data();
-        
-        // Set up interval
         intervalId = setInterval(sendPM2Data, 5000);
 
         ws.on('message', async (message) => {
@@ -657,9 +568,7 @@ function handlePM2Data(ws, user, connectionId, request) {
 
 function handleChatWrapper(ws, user, connectionId, request) {
     try {
-        // Use original chat handler
         handleChat(ws, user, request);
-        
         ws.on('close', () => {
             handleDisconnection(connectionId);
         });
@@ -670,9 +579,7 @@ function handleChatWrapper(ws, user, connectionId, request) {
 
 function handleWhatsappWrapper(ws, connectionId, request) {
     try {
-        // Use original whatsapp handler
         handleWhatsapp(ws, request);
-        
         ws.on('close', () => {
             handleDisconnection(connectionId);
         });
@@ -687,9 +594,12 @@ function handleDisconnection(connectionId) {
         if (connection) {
             safeLog('info', `Connection closed: ${connectionId}`);
             
-            // If it's an editor connection, handle cleanup
             if (connection.clientId) {
                 editorHandler.handleDisconnection(connection.clientId);
+            }
+            
+            if (connection.user && connection.user.userId) {
+                removeConnection(connection.user.userId);
             }
             
             connections.delete(connectionId);
@@ -699,7 +609,6 @@ function handleDisconnection(connectionId) {
     }
 }
 
-// Graceful shutdown
 function gracefulShutdown() {
     safeLog('info', 'Shutting down gracefully...');
     
@@ -724,22 +633,17 @@ function gracefulShutdown() {
     }
 }
 
-// Handle process signals
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
-// Handle uncaught errors - but never crash
 process.on('uncaughtException', (error) => {
     handleError(error, 'Uncaught Exception');
-    // Don't exit - just log
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     handleError(reason, 'Unhandled Rejection');
-    // Don't exit - just log
 });
 
-// Start server with proper error handling
 function startServer() {
     return new Promise((resolve, reject) => {
         const startTime = Date.now();
@@ -748,7 +652,7 @@ function startServer() {
             if (error.code === 'EADDRINUSE') {
                 safeLog('error', `Port ${PORT} is already in use. Waiting 3 seconds before retry...`);
                 setTimeout(() => {
-                    if (Date.now() - startTime < 30000) { // Only retry for 30 seconds
+                    if (Date.now() - startTime < 30000) {
                         startServer().then(resolve).catch(reject);
                     } else {
                         reject(new Error(`Failed to start server after 30 seconds: ${error.message}`));
@@ -767,7 +671,6 @@ function startServer() {
     });
 }
 
-// Start the server
 startServer().catch((error) => {
     safeLog('error', 'Failed to start server:', error);
     process.exit(1);
