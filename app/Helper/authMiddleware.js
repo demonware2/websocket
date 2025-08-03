@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const { log } = require('console');
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const ALLOWED_ORIGIN = 'https://172.18.177.22';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 const RESTRICTED_PATHS = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const RESTRICTED_PATHS_HTTP = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const MAX_CONNECTIONS_PER_USER = 30;
