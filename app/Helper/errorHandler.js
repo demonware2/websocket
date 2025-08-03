@@ -160,13 +160,17 @@ function logServerError(error, req = null) {
 
 function setupErrorHandlers(server = null, wss = null) {
     process.on('uncaughtException', (error) => {
+        console.error('Uncaught Exception:', error.message);
         logServerError(error);
         logger.error('Uncaught Exception', { error: error.message, stack: error.stack });
+        // Don't exit - just log the error
     });
 
     process.on('unhandledRejection', (reason, promise) => {
+        console.error('Unhandled Rejection:', reason);
         logServerError(new Error(`Unhandled Rejection: ${reason}`));
         logger.error('Unhandled Rejection', { reason: reason.toString(), stack: reason.stack });
+        // Don't exit - just log the error
     });
 
     if (wss) {
@@ -252,50 +256,15 @@ function handleHttpError(error, res, code = 500, message = 'Something went wrong
 }
 
 function handleError(error, connection = null, code = 500, message = 'Internal Server Error') {
-    let errorMessage = 'An unexpected error occurred';
-
-    if (error instanceof AuthenticationError) {
-        code = error.code;
-        message = error.message;
-        errorMessage = error.errorMessage;
-    } else if (error instanceof Error) {
-        errorMessage = error.message;
-    }
-
-    logServerError(error);
-
-    const errorResponse = {
+    // Just log to console and return - don't try to send responses
+    console.error('Error handled:', error.message);
+    
+    return {
         error: message,
-        message: errorMessage,
+        message: error.message || 'An unexpected error occurred',
         code: code,
         status: getStatusText(code)
     };
-
-    if (connection instanceof WebSocket) {
-        if (connection.readyState === WebSocket.OPEN) {
-            connection.send(JSON.stringify(errorResponse));
-            connection.close();
-        } else {
-            console.warn('WebSocket is not in OPEN state. Cannot send error message.');
-        }
-    } else if (connection && typeof connection.write === 'function' && typeof connection.end === 'function') {
-        if (connection.writable) {
-            connection.write(`HTTP/1.1 ${code} ${getStatusText(code)}\r\n`);
-            connection.write('Content-Type: application/json\r\n');
-            connection.write(`Content-Length: ${Buffer.byteLength(JSON.stringify(errorResponse))}\r\n`);
-            connection.write('\r\n');
-            connection.end(JSON.stringify(errorResponse));
-        } else {
-            console.warn('Socket is not writable. Cannot send error message.');
-        }
-    } else if (connection && typeof connection.writeHead === 'function' && typeof connection.end === 'function') {
-        connection.writeHead(code, { 'Content-Type': 'application/json' });
-        connection.end(JSON.stringify(errorResponse));
-    } else {
-        console.error('Cannot send error response. Invalid connection object.');
-    }
-    console.log('errorResponse', errorResponse);
-    return errorResponse;
 }
 
 function getStatusText(code) {

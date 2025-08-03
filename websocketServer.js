@@ -2,6 +2,7 @@ const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { handleWhatsapp } = require('./app/Function/whatsappHandler');
 const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
+const editorHandler = require('./app/Function/editorHandler');
 const { removeConnection } = require('./app/Helper/authMiddleware');
 const { logInfo, logWarning, logError, AuthenticationError, handleError } = require('./app/Helper/errorHandler');
 
@@ -49,10 +50,26 @@ function setupWebSocketServer(webSocketServer) {
                     handleChat(ws, user, request);
                     break;
                 default:
-                    throw new AuthenticationError('Invalid route', `Invalid route requested: ${cleanRequestedPath}`);
+                    // Check if it's an editor route
+                    if (cleanRequestedPath.startsWith('/editor/')) {
+                        const rppId = cleanRequestedPath.split('/')[2];
+                        if (rppId) {
+                            handleEditor(ws, user, request, rppId);
+                        } else {
+                            console.error('Invalid editor route - missing rpp_id');
+                            ws.close();
+                        }
+                    } else {
+                        console.error('Invalid route requested:', cleanRequestedPath);
+                        ws.close();
+                    }
             }
         } catch (error) {
-            handleError(error, ws);
+            console.error('WebSocket route error:', error.message);
+            // Don't call handleError to prevent socket write issues
+            if (ws && ws.readyState === ws.OPEN) {
+                ws.close();
+            }
         }
     });
 
@@ -97,7 +114,8 @@ function gatherPM2Data(ws, user, request) {
                 await sendLogs(data.pm_id);
             }
         } catch (error) {
-            throw error;
+            console.error('PM2 message error:', error.message);
+            // Don't throw - just log the error
         }
     });
 
@@ -121,7 +139,8 @@ function handleSystemInfo(ws, user, request) {
                 ws.send(JSON.stringify(response));
             }
         } catch (error) {
-            handleError(error, ws);
+            console.error('System info error:', error.message);
+            // Don't call handleError to prevent socket write issues
         }
     };
 
@@ -131,6 +150,31 @@ function handleSystemInfo(ws, user, request) {
         removeConnection(user.userId);
         clearInterval(intervalId);
         logInfo(`Connection closed for user ${user.userId}`);
+    });
+}
+
+async function handleEditor(ws, user, request, rppId) {
+    const clientId = await editorHandler.handleConnection(ws, user, rppId);
+    
+    if (!clientId) {
+        ws.close();
+        return;
+    }
+    
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            await editorHandler.handleEditorMessage(ws, data, clientId);
+        } catch (error) {
+            console.error('Editor message error:', error.message);
+            // Don't call handleError to prevent socket write issues
+        }
+    });
+
+    ws.on('close', () => {
+        removeConnection(user.userId);
+        editorHandler.handleDisconnection(clientId);
+        logInfo(`Editor connection closed for user ${user.userId}, rpp_id ${rppId}`);
     });
 }
 

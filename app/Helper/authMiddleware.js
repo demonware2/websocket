@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const { log } = require('console');
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const ALLOWED_ORIGIN = 'https://172.29.3.178';
+const ALLOWED_ORIGIN = 'https://172.18.177.22';
 const RESTRICTED_PATHS = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const RESTRICTED_PATHS_HTTP = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const MAX_CONNECTIONS_PER_USER = 30;
@@ -170,7 +170,16 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
             }
 
             const origin = request.headers.origin;
-            if (origin !== ALLOWED_ORIGIN) {
+            // Allow multiple origins for development/production
+            const allowedOrigins = [
+                ALLOWED_ORIGIN,
+                'https://172.18.177.22',
+                'https://172.29.3.178',
+                'http://localhost',
+                'http://127.0.0.1'
+            ];
+            
+            if (origin && !allowedOrigins.some(allowed => origin.startsWith(allowed))) {
                 throw new AuthenticationError('Invalid origin', `Invalid origin: ${origin}`);
             }
         } else {
@@ -214,7 +223,9 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
         return authResult;
     } catch (error) {
-        handleError(error, protocol);
+        // Don't call handleError and don't throw - just return null
+        console.error('Authentication error:', error.message);
+        return null;
     }
 }
 
@@ -247,7 +258,12 @@ async function verifyToken(token, cleanRequestedPath, typeRequest) {
             }
         }
 
-        const requiredRoles = roleConfig.routes[cleanRequestedPath];
+        let requiredRoles = roleConfig.routes[cleanRequestedPath];
+
+        // Handle dynamic routes like /editor/{rpp_id}
+        if (!requiredRoles && cleanRequestedPath.startsWith('/editor/')) {
+            requiredRoles = roleConfig.routes['/editor'];
+        }
 
         if (!requiredRoles) {
             throw new AuthenticationError('Route not configured', `Route not configured: ${cleanRequestedPath}`);

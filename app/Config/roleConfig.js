@@ -8,5 +8,6 @@ module.exports = {
         '/handleSystemInfo': [1, 2, 3, 4],
         '/gatherPM2Data': [1, 2, 3, 4],
         '/handleChat': [1, 2, 3, 4], // Added new route for chat
+        '/editor': [1, 2, 3, 4], // Editor route for all authenticated users
     },
 };
