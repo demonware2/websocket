@@ -786,5 +786,6 @@ async function gatherSystemData() {
 }
 
 module.exports = {
-  gatherSystemData
+  gatherSystemData,
+  getSystemInfo: gatherSystemData
 };

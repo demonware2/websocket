@@ -1,8 +1,10 @@
 module.exports = {
   apps: [{
-    name: "server",
-    script: 'server.js',
+    name: "websocket",
+    script: 'new-server.js',
     watch: false,
+    max_restarts: 3,
+    restart_delay: 5000,
     env: {
       PORT: 9950,
       NODE_ENV: "development"
