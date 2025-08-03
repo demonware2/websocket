@@ -346,7 +346,10 @@ server.on('upgrade', async (request, socket, head) => {
         
         const url = new URL(request.url, `http://${request.headers.host}`);
         let pathname = url.pathname;
-        
+
+        if (pathname.startsWith('/siroum-websocket')) {
+            pathname = pathname.replace(/^\/siroum-websocket/, '');
+        }
         if (pathname.startsWith('/websocket')) {
             pathname = pathname.replace(/^\/websocket/, '');
         }
