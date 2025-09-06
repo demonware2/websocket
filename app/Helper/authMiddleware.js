@@ -124,7 +124,6 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
         const ip = request.connection.remoteAddress;
         const normalizedIP = normalizeIP(ip);
 
-        // Skip Redis-dependent checks if Redis is not available
         let skipRedisChecks = false;
         try {
             await redis.ping();
@@ -185,7 +184,6 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
             }
 
             const origin = request.headers.origin;
-            // Allow multiple origins for development/production
             const allowedOrigins = [
                 ALLOWED_ORIGIN,
                 'https://172.18.177.22',
@@ -238,7 +236,6 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
         return authResult;
     } catch (error) {
-        // Don't call handleError and don't throw - just return null
         logWarning('Authentication error', { error: error.message });
         return null;
     }
@@ -274,7 +271,6 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
                 if (userRoles) {
                     setUserRolesToCache(decoded.userId, userRoles);
                 } else {
-                    // Default role if database is not available
                     userRoles = [1];
                     logDebug(`Using default role`, { userId: decoded.userId });
                 }
@@ -286,18 +282,16 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
 
         let requiredRoles = roleConfig.routes[cleanRequestedPath];
 
-        // Handle dynamic routes like /editor/{rpp_id}
         if (!requiredRoles && cleanRequestedPath.startsWith('/editor/')) {
             requiredRoles = roleConfig.routes['/editor'];
         }
 
         if (!requiredRoles) {
-            // Default to allowing access if route not configured (for system routes)
             const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat', '/handleWhatsapp'];
             if (!allowedPaths.includes(cleanRequestedPath)) {
                 throw new AuthenticationError('Route not configured', `Route not configured: ${cleanRequestedPath}`);
             }
-            requiredRoles = [1]; // Default role
+            requiredRoles = [1];
         }
 
         if (!userRoles.some(role => requiredRoles.includes(parseInt(role)))) {
@@ -409,7 +403,6 @@ function validateWhatsAppSecret(secret) {
         throw new AuthenticationError('Invalid WhatsApp secret', 'Invalid WhatsApp secret');
     }
 
-    // Fixed regex - was missing + for multiple characters
     const secretRegex = /^[A-Za-z0-9]+$/;
     if (!secretRegex.test(secret)) {
         throw new AuthenticationError('Invalid WhatsApp secret format', 'Invalid WhatsApp secret format');
