@@ -1,5 +1,6 @@
 const pm2 = require('pm2');
 const fs = require('fs').promises;
+const fssync = require('fs');
 const { AuthenticationError, handleError, logError, logInfo } = require('../Helper/errorHandler');
 const { log } = require('console');
 
@@ -38,6 +39,66 @@ function getProcesses() {
   });
 }
 
+// Efficiently read only the last N lines of a file without loading the whole file
+async function tailFileLastLines(filePath, maxLines = 100, chunkSize = 128 * 1024) {
+  try {
+    const stat = await fs.stat(filePath);
+    if (!stat || stat.size === 0) return [];
+
+    const fd = await fs.open(filePath, 'r');
+    try {
+      let position = stat.size;
+      let linesFound = 0;
+      const chunks = [];
+
+      while (position > 0 && linesFound <= maxLines) {
+        const readStart = Math.max(0, position - chunkSize);
+        const toRead = position - readStart;
+        const buf = Buffer.allocUnsafe(toRead);
+        await fd.read(buf, 0, toRead, readStart);
+        chunks.push(buf);
+
+        // Count newlines in this chunk
+        for (let i = 0; i < buf.length; i++) {
+          if (buf[i] === 0x0a) linesFound++; // '\n'
+        }
+
+        position = readStart;
+
+        // Safety stop in case of extremely long lines; avoid reading entire gigantic files
+        if (chunks.length > 128 && linesFound === 0) break; // ~16MB guard at 128 * 128KB
+      }
+
+      // Build string from the collected tail chunks (reverse order)
+      const data = Buffer.concat(chunks.reverse()).toString('utf8');
+      const allLines = data.split('\n');
+      const lastLines = allLines.slice(-maxLines);
+      return lastLines;
+    } finally {
+      await fd.close();
+    }
+  } catch (err) {
+    // If tailing fails (e.g., file truncated/rotated), fallback to best-effort small read
+    try {
+      const fallbackSize = 64 * 1024;
+      const stat2 = await fs.stat(filePath);
+      const start = Math.max(0, stat2.size - fallbackSize);
+      const stream = fssync.createReadStream(filePath, { start, end: stat2.size });
+      const chunks = [];
+      return await new Promise((resolve) => {
+        stream.on('data', (c) => chunks.push(c));
+        stream.on('error', () => resolve([]));
+        stream.on('end', () => {
+          const txt = Buffer.concat(chunks).toString('utf8');
+          resolve(txt.split('\n').slice(-maxLines));
+        });
+      });
+    } catch (_) {
+      return [];
+    }
+  }
+}
+
 async function getLogsPM2(pm_id, lines = 100) {
   return new Promise((resolve, reject) => {
     pm2.describe(pm_id, async (err, processDescription) => {
@@ -50,11 +111,10 @@ async function getLogsPM2(pm_id, lines = 100) {
       } else {
         const logFile = processDescription[0].pm2_env.pm_out_log_path;
         try {
-          const data = await fs.readFile(logFile, 'utf8');
-          const logs = data.split('\n').slice(-lines);
+          const logs = await tailFileLastLines(logFile, lines);
           resolve(logs);
         } catch (error) {
-          logError(`Failed to read log file for process ${pm_id}:`, error);
+          logError(`Failed to tail log file for process ${pm_id}:`, error);
           reject(error);
         }
       }

@@ -1,5 +1,31 @@
 const os = require('os');
 const { exec } = require('child_process');
+
+// Module-level sampling cache to avoid running heavy commands per-connection
+let cachedSystemData = null;
+let samplingInterval = null;
+let inflightSample = null;
+const SAMPLE_INTERVAL_MS = 5000;
+
+async function sampleSystemInfoOnce() {
+  try {
+    // Reuse existing gather to preserve structure/fields
+    cachedSystemData = await gatherSystemData();
+    return cachedSystemData;
+  } catch (e) {
+    // Keep previous cache on error; return a minimal payload
+    return cachedSystemData || { timestamp: Date.now(), error: e.message };
+  }
+}
+
+function ensureSamplerStarted() {
+  if (samplingInterval) return;
+  // Kick off an immediate sample, and then schedule periodic updates
+  inflightSample = sampleSystemInfoOnce().finally(() => { inflightSample = null; });
+  samplingInterval = setInterval(() => {
+    sampleSystemInfoOnce();
+  }, SAMPLE_INTERVAL_MS);
+}
 let previousNetworkData = {};
 let previousDiskStats = null;
 let previousTimeStamp = Date.now();
@@ -590,7 +616,7 @@ function getServicesInfo() {
   });
 }
 
-function getSystemInfo() {
+function getSystemInfoRaw() {
   return new Promise((resolve) => {
     const basicInfo = {
       hostname: os.hostname(),
@@ -785,7 +811,21 @@ async function gatherSystemData() {
   }
 }
 
+// Public API: return cached snapshot to callers to avoid heavy work per call
+async function getSystemInfo(/* type */) {
+  ensureSamplerStarted();
+  if (cachedSystemData) return cachedSystemData;
+  // If a sample is in-flight, await it; otherwise run one synchronously
+  if (inflightSample) return inflightSample;
+  inflightSample = sampleSystemInfoOnce();
+  try {
+    return await inflightSample;
+  } finally {
+    inflightSample = null;
+  }
+}
+
 module.exports = {
   gatherSystemData,
-  getSystemInfo: gatherSystemData
+  getSystemInfo
 };
