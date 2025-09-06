@@ -4,7 +4,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const { setupWebSocketServer } = require('./websocketServer');
 const { verifyAuthentication } = require('./app/Helper/authMiddleware');
-const { AuthenticationError ,setupErrorHandlers , handleError } = require('./app/Helper/errorHandler');
+const { AuthenticationError ,setupErrorHandlers , handleError, logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
 const { handleRequestHttp } = require('./requestServer');
 
 const PORT = parseInt(process.env.PORT) || 9950;
@@ -15,14 +15,14 @@ const wss = new WebSocket.Server({ noServer: true });
 setupWebSocketServer(wss);
 
 server.on('upgrade', async function upgrade(request, socket, head) {
-    console.log(`WebSocket upgrade request from ${socket.remoteAddress} to ${request.url}`);
+    logDebug(`WebSocket upgrade request from ${socket.remoteAddress} to ${request.url}`);
     
     try {
         const { pathname } = new URL(request.url, `http://${request.headers.host}`);
 
         const result = await verifyAuthentication(request, pathname, 'ws', socket);
         if (!result) {
-            console.log('Authentication failed for:', pathname);
+            logWarning('Authentication failed', { pathname });
             // Just close the socket, don't throw error
             if (socket && !socket.destroyed) {
                 socket.destroy();
@@ -30,11 +30,11 @@ server.on('upgrade', async function upgrade(request, socket, head) {
             return;
         }
 
-        console.log('Authentication successful for user:', result.userId);
+        logDebug('Authentication successful', { userId: result.userId });
         const { newToken, ...user } = result;
 
         wss.handleUpgrade(request, socket, head, function done(ws) {
-            console.log('WebSocket connection established');
+            logDebug('WebSocket connection established');
             wss.emit('connection', ws, request, user, pathname);
 
             if (newToken) {
@@ -42,7 +42,7 @@ server.on('upgrade', async function upgrade(request, socket, head) {
             }
         });
     } catch (error) {
-        console.error('WebSocket upgrade error:', error.message);
+        logError('WebSocket upgrade error', { error: error.message });
         
         // Just close the socket cleanly - don't crash the server
         try {
@@ -59,7 +59,7 @@ server.on('upgrade', async function upgrade(request, socket, head) {
 
 server.on('request', (req, res) => {
     handleRequestHttp(req, res).catch(error => {
-        console.error('HTTP request error:', error.message);
+        logError('HTTP request error', { error: error.message });
         
         if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -70,16 +70,15 @@ server.on('request', (req, res) => {
 
 // Remove early error handler setup - will be done after server starts
 
-console.log(`Attempting to listen on port ${PORT}...`);
+logInfo(`Attempting to listen on port ${PORT}...`);
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Successfully listening on 0.0.0.0:${PORT}`);
-    console.log(`WebSocket server running on 0.0.0.0:${PORT}`);
+    logInfo(`Successfully listening on 0.0.0.0:${PORT}`);
+    logInfo(`WebSocket server running on 0.0.0.0:${PORT}`);
     
     // Set up error handlers after server starts
     setupErrorHandlers(server, wss);
     
 }).on('error', (err) => {
-    console.error(`ERROR BINDING TO PORT: ${err.message}`);
-    console.error(err);
+    logError('ERROR BINDING TO PORT', { error: err.message, stack: err.stack });
     process.exit(1);
 });

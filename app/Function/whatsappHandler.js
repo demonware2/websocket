@@ -86,7 +86,7 @@ function handleWhatsapp(ws, request) {
                 if(isGroup) {
                     if (data.message.body.startsWith('!check')) {
                         if (data.message.action === 'processMessageLocal') {
-                            console.log('tes')
+                            // removed noisy debug log
                             enqueueMessage(data.chat.id, data.message.body, whatsappPort, data.message.chatType, settings.messageDelay, 'checkTrue', secret_whatsapp);
                             responseSent = true;
                         } else {
@@ -153,7 +153,7 @@ async function handleBotMenu(userId, message, secret_whatsapp) {
 
     // Check if the current menu exists
     if (!currentMenu) {
-        console.error(`Menu "${currentMenuName}" not found. Resetting to main menu.`);
+        logError(`Menu "${currentMenuName}" not found. Resetting to main menu.`);
         userState.menuStack = ['main'];
         await redis.set(userStateKey, JSON.stringify(userState), 'EX', MENU_TIMEOUT_DURATION);
         return `I'm sorry, there was an error. Let's start over.\n${displayMenu('main')}`;
@@ -212,7 +212,7 @@ function handleMenuAction(action, userId, secret_whatsapp) {
 function displayMenu(menuName) {
     const currentMenu = botMenu[menuName];
     if (!currentMenu) {
-        console.error(`Menu "${menuName}" not found in displayMenu function.`);
+        logError(`Menu "${menuName}" not found in displayMenu function.`);
         return "I'm sorry, there was an error displaying the menu. Please type 'start' to begin again.";
     }
     let display = `${currentMenu.title}:\n`;

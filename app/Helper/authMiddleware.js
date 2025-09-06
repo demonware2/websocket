@@ -5,7 +5,7 @@ const roleConfig = require('../Config/roleConfig');
 const Redis = require('ioredis');
 const RateLimit = require('rate-limiter-flexible');
 const net = require('net');
-const { AuthenticationError, handleError, logWarning, logInfo } = require('../Helper/errorHandler');
+const { AuthenticationError, handleError, logWarning, logInfo, logDebug } = require('../Helper/errorHandler');
 const crypto = require('crypto');
 const { log } = require('console');
 
@@ -129,7 +129,7 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
         try {
             await redis.ping();
         } catch (redisError) {
-            console.log('Redis not available, skipping Redis-dependent checks');
+            logWarning('Redis not available, skipping Redis-dependent checks');
             skipRedisChecks = true;
         }
 
@@ -239,7 +239,7 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
         return authResult;
     } catch (error) {
         // Don't call handleError and don't throw - just return null
-        console.error('Authentication error:', error.message);
+        logWarning('Authentication error', { error: error.message });
         return null;
     }
 }
@@ -276,10 +276,10 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
                 } else {
                     // Default role if database is not available
                     userRoles = [1];
-                    console.log(`Using default role for user ${decoded.userId}`);
+                    logDebug(`Using default role`, { userId: decoded.userId });
                 }
             } catch (dbError) {
-                console.log('Database not available, using default role');
+                logWarning('Database not available, using default role');
                 userRoles = [1];
             }
         }

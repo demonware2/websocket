@@ -4,7 +4,7 @@ const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
 const editorHandler = require('./app/Function/editorHandler');
 const { removeConnection } = require('./app/Helper/authMiddleware');
-const { logInfo, logWarning, logError, AuthenticationError, handleError } = require('./app/Helper/errorHandler');
+const { logInfo, logWarning, logError, logDebug, AuthenticationError, handleError } = require('./app/Helper/errorHandler');
 
 let wss;
 
@@ -12,7 +12,7 @@ function setupWebSocketServer(webSocketServer) {
     wss = webSocketServer;
 
     wss.on('connection', (ws, request, user, pathname) => {
-        logInfo(`New client connected: User ID ${user.userId}, Role ID ${user.roleId} on path ${pathname}`);
+        logDebug(`New client connected`, { userId: user.userId, roleId: user.roleId, path: pathname });
 
         ws.userId = user.userId;
 
@@ -56,16 +56,16 @@ function setupWebSocketServer(webSocketServer) {
                         if (rppId) {
                             handleEditor(ws, user, request, rppId);
                         } else {
-                            console.error('Invalid editor route - missing rpp_id');
+                            logWarning('Invalid editor route - missing rpp_id');
                             ws.close();
                         }
                     } else {
-                        console.error('Invalid route requested:', cleanRequestedPath);
+                        logWarning('Invalid route requested', { path: cleanRequestedPath });
                         ws.close();
                     }
             }
         } catch (error) {
-            console.error('WebSocket route error:', error.message);
+            logError('WebSocket route error', { error: error.message });
             // Don't call handleError to prevent socket write issues
             if (ws && ws.readyState === ws.OPEN) {
                 ws.close();
@@ -114,7 +114,7 @@ function gatherPM2Data(ws, user, request) {
                 await sendLogs(data.pm_id);
             }
         } catch (error) {
-            console.error('PM2 message error:', error.message);
+            logError('PM2 message error', { error: error.message });
             // Don't throw - just log the error
         }
     });
@@ -139,7 +139,7 @@ function handleSystemInfo(ws, user, request) {
                 ws.send(JSON.stringify(response));
             }
         } catch (error) {
-            console.error('System info error:', error.message);
+            logError('System info error', { error: error.message });
             // Don't call handleError to prevent socket write issues
         }
     };
@@ -166,7 +166,7 @@ async function handleEditor(ws, user, request, rppId) {
             const data = JSON.parse(message);
             await editorHandler.handleEditorMessage(ws, data, clientId);
         } catch (error) {
-            console.error('Editor message error:', error.message);
+            logError('Editor message error', { error: error.message });
             // Don't call handleError to prevent socket write issues
         }
     });

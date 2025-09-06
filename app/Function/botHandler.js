@@ -1,7 +1,7 @@
 const mysql = require('mysql2/promise');
 const Redis = require('ioredis');
 const axios = require('axios');
-const { AuthenticationError, logInfo, logWarning, logError } = require('../Helper/errorHandler');
+const { AuthenticationError, logInfo, logWarning, logError, logDebug } = require('../Helper/errorHandler');
 const { enqueueMessage, setProcessMessageFunction } = require('../Helper/whatsappUtils');
 
 const redis = new Redis({
@@ -9,7 +9,7 @@ const redis = new Redis({
     port: process.env.REDIS_PORT,
 });
 
-redis.on('error', (err) => console.error('Redis Client Error', err));
+redis.on('error', (err) => logError('Redis Client Error', { error: err.message, stack: err.stack }));
 
 const dbConfig = {
     host: process.env.DB_HOST,
@@ -166,33 +166,33 @@ async function processMessage(chatType, chatId, message, whatsappPort, secret_wh
         let settings = await loadSettings(secret_whatsapp);
 
         if (!settings) {
-            console.log('Failed to load setting')
+            logWarning('Failed to load settings');
             return { success: false, message: 'Failed to load settings' };
         }
 
         if (!settings.is_bot_active) {
-            console.log('Bot is not active');
+            logInfo('Bot is not active');
             return { success: false, message: 'Bot is not active' };
         }
 
         if (settings.type === 'group') {
             if (chatType !== 'group') {
-                console.log('Group chat required')
+                logInfo('Group chat required');
                 return { success: false, message: 'Group chat required' };
             }
 
             if (!settings.allowed_group_ids.includes(chatId)) {
-                console.log('Group not allowed')
+                logInfo('Group not allowed');
                 return { success: false, message: 'Group not allowed' };
             }
         } else {
             if (chatType !== 'private') {
-                console.log('Private chat required')
+                logInfo('Private chat required');
                 return { success: false, message: 'Private chat required' };
             }
         }
 
-        console.log('sukses')
+        logDebug('Validation success for incoming message');
 
         if (!messageQueues.has(whatsappPort)) {
             messageQueues.set(whatsappPort, []);
@@ -208,7 +208,7 @@ async function processMessage(chatType, chatId, message, whatsappPort, secret_wh
             processQueue(whatsappPort, settings, secret_whatsapp, messageDelay);
         }
 
-        console.log('Sukses')
+        logDebug('Message enqueued successfully');
 
         return { success: true, message: 'Message queued for processing' };
     } catch (error) {
@@ -442,7 +442,7 @@ async function processItem(chatId, message, whatsappPort, secret_whatsapp, chatT
         await new Promise(resolve => setTimeout(resolve, 5000));
         let { command, dataString, dataArray } = parseCommandAndData(message);
 
-        console.log('masuk sini')
+        logDebug('Processing message item start');
 
         let botResponse = await loadBotResponses(secret_whatsapp, command, 'whatsapp');
 
@@ -452,7 +452,7 @@ async function processItem(chatId, message, whatsappPort, secret_whatsapp, chatT
         }
 
         let responseMessage;
-        console.log(botResponse.type);
+        logDebug('Bot response type', { type: botResponse.type });
 
         switch (botResponse.type) {
             case 'basic':
@@ -504,7 +504,7 @@ async function processItem(chatId, message, whatsappPort, secret_whatsapp, chatT
                 break;
             case 'dayoff':
                 const dayOffInfo = await getDayOffInfo(dataArray[0]);
-                console.log(dayOffInfo);
+                logDebug('Day off API result', { result: dayOffInfo });
                 if (dayOffInfo.success) {
                     responseMessage = dayOffInfo.message;
                 } else {

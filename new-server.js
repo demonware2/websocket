@@ -6,6 +6,7 @@ const Redis = require('ioredis');
 const { v4: uuidv4 } = require('uuid');
 
 const { verifyAuthentication, removeConnection } = require('./app/Helper/authMiddleware');
+const { logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
 const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler');
@@ -35,9 +36,21 @@ const redis = new Redis({
 const connections = new Map();
 
 function safeLog(level, message, data = {}) {
-    const timestamp = new Date().toISOString();
-    const logData = typeof data === 'object' ? JSON.stringify(data, null, 2) : data;
-    console.log(`[${timestamp}] ${level.toUpperCase()}: ${message}`, logData);
+    const meta = typeof data === 'object' ? data : { data };
+    switch ((level || 'info').toLowerCase()) {
+        case 'error':
+            logError(message, meta);
+            break;
+        case 'warn':
+        case 'warning':
+            logWarning(message, meta);
+            break;
+        case 'debug':
+            logDebug(message, meta);
+            break;
+        default:
+            logInfo(message, meta);
+    }
 }
 
 function handleError(error, context = 'Unknown') {

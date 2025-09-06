@@ -1,7 +1,7 @@
 const { URL } = require('url');
 const { verifyAuthentication } = require('./app/Helper/authMiddleware');
 const { matrixRequest } = require('./app/Function/matrixHandler');
-const { AuthenticationError, handleError } = require('./app/Helper/errorHandler');
+const { AuthenticationError, handleError, logDebug } = require('./app/Helper/errorHandler');
 
 const MATRIX_ROUTE = '/chatmatrix';
 const NODE_REQUEST = '/noderequest';
@@ -25,7 +25,7 @@ async function handleRequestHttp(req, res) {
 
             switch (pathname) {
                 case NODE_REQUEST + '/test1':
-                    console.log('Handling system info request');
+                    logDebug('Handling system info request');
                     break;
                 default:
                     throw new AuthenticationError('Invalid route', `Invalid route requested: ${pathname}`, 404);
