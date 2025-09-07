@@ -37,6 +37,15 @@ class EditorHandler {
         this.startPeriodicSync();
     }
 
+    safeSend(ws, payload) {
+        try {
+            if (!ws || ws.readyState !== 1) return false;
+            const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+            ws.send(data);
+            return true;
+        } catch (_) { return false; }
+    }
+
     async handleConnection(ws, user, rppId) {
         const clientId = uuidv4();
         
@@ -61,7 +70,7 @@ class EditorHandler {
 
             const editorData = await this.getEditorData(rppId);
             
-            ws.send(JSON.stringify({
+            this.safeSend(ws, {
                 type: 'editor_init',
                 data: editorData,
                 clientId,
@@ -69,7 +78,7 @@ class EditorHandler {
                     rppId,
                     activeUsers: await this.getActiveUsers(rppId)
                 }
-            }));
+            });
 
             await redis.sadd(`editor:${rppId}:clients`, clientId);
             
@@ -141,7 +150,7 @@ class EditorHandler {
                     break;
                 case 'ping':
                     // Keep connection alive
-                    ws.send(JSON.stringify({ type: 'pong' }));
+                    this.safeSend(ws, { type: 'pong' });
                     break;
             }
         } catch (error) {
@@ -347,9 +356,7 @@ class EditorHandler {
     broadcastToEditor(rppId, message, excludeClientId = null) {
         this.clients.forEach((client, clientId) => {
             if (client.rppId === rppId && clientId !== excludeClientId) {
-                if (client.ws.readyState === 1) {
-                    client.ws.send(JSON.stringify(message));
-                }
+                this.safeSend(client.ws, message);
             }
         });
     }

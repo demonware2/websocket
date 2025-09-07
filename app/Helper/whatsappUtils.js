@@ -1,6 +1,7 @@
 const axios = require('axios');
 
 const messageQueue = [];
+const MAX_QUEUE_LENGTH = parseInt(process.env.WA_MAX_QUEUE_LENGTH || '10000', 10);
 let isProcessingQueue = false;
 let processMessageFunction;
 
@@ -53,6 +54,12 @@ async function sendResponseToWhatsApp(chatId, message, whatsappPort, chatType) {
 }
 
 function enqueueMessage(chatId, message, whatsappPort, chatType, messageDelay, messageType, secret_whatsapp) {
+    if (messageQueue.length >= MAX_QUEUE_LENGTH) {
+        // Drop oldest to keep memory bounded
+        messageQueue.shift();
+        // Best-effort log; avoid throwing if logger unavailable
+        try { logError('WhatsApp message queue at capacity; dropping oldest'); } catch (_) {}
+    }
     messageQueue.push({ chatId, message, whatsappPort, chatType, messageDelay, messageType, secret_whatsapp });
     if (!isProcessingQueue) {
         processMessageQueue();

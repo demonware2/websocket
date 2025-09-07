@@ -22,6 +22,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "chat:worker": "node worker/chatPersistenceWorker.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

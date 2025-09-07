@@ -10,7 +10,13 @@ const { handleRequestHttp } = require('./requestServer');
 const PORT = parseInt(process.env.PORT) || 9950;
 
 const server = http.createServer();
-const wss = new WebSocket.Server({ noServer: true });
+// Harden WS server: limit payloads and disable compression to reduce memory/CPU spikes
+const wss = new WebSocket.Server({
+    noServer: true,
+    // Allow larger frames to support editor payloads (default 5MB)
+    maxPayload: parseInt(process.env.WS_MAX_PAYLOAD || String(5 * 1024 * 1024), 10),
+    perMessageDeflate: false
+});
 
 setupWebSocketServer(wss);
 
@@ -82,3 +88,24 @@ server.listen(PORT, '0.0.0.0', () => {
     logError('ERROR BINDING TO PORT', { error: err.message, stack: err.stack });
     process.exit(1);
 });
+
+// Conservative HTTP timeouts to avoid hanging resources
+try {
+    server.requestTimeout = parseInt(process.env.HTTP_REQUEST_TIMEOUT || '60000', 10); // 60s
+    server.headersTimeout = parseInt(process.env.HTTP_HEADERS_TIMEOUT || '65000', 10); // 65s
+    server.keepAliveTimeout = parseInt(process.env.HTTP_KEEPALIVE_TIMEOUT || '5000', 10); // 5s
+} catch (_) {
+    // Ignore if not supported on this Node version
+}
+
+// Ensure module-level cleanup hooks can run on shutdown
+try {
+    const editorHandler = require('./app/Function/editorHandler');
+    ['SIGINT', 'SIGTERM', 'SIGQUIT'].forEach(sig => {
+        process.on(sig, () => {
+            try { editorHandler.cleanup(); } catch (_) {}
+        });
+    });
+} catch (_) {
+    // Optional dependency; safe to ignore if missing
+}

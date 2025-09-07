@@ -285,43 +285,4 @@ async function handleGetChatHistory(userId, chatId, isGroup) {
 }
 
 
-async function processPersistenceQueue() {
-    while (true) {
-        try {
-            const messageJSON = await persistenceRedis.blpop('chat_persistence_queue', 0);
-            if (messageJSON) {
-                const messageObject = JSON.parse(messageJSON[1]);
-
-                // Save to MySQL database here
-                const connection = await mysql.createConnection(dbConfig);
-                await connection.execute(
-                    'INSERT INTO chat_messages (id, type, sender_id, recipient_id, group_id, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    [
-                        messageObject.id,
-                        messageObject.type,
-                        messageObject.senderId,
-                        messageObject.type === 'private' ? messageObject.recipientId : null,
-                        messageObject.type === 'group' ? messageObject.groupId : null,
-                        messageObject.content,
-                        messageObject.timestamp
-                    ]
-                );
-                await connection.end();
-
-                logInfo('Message persisted to database:', messageObject.id);
-            }
-        } catch (error) {
-            logError('Error processing message queue:', error);
-            // Wait before trying again
-            await new Promise(resolve => setTimeout(resolve, 5000));
-        }
-    }
-}
-
-// Run the worker in a separate process
-if (process.env.RUN_PERSISTENCE_WORKER === 'true') {
-    logInfo('Starting chat persistence worker...');
-    processPersistenceQueue().catch(err => logError('Persistence worker error:', err));
-}
-
 module.exports = { handleChat };
