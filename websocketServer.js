@@ -2,6 +2,7 @@ const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { handleWhatsapp } = require('./app/Function/whatsappHandler');
 const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
+const { handleCallCenter } = require('./app/Function/callCenterHandler');
 const editorHandler = require('./app/Function/editorHandler');
 const { removeConnection } = require('./app/Helper/authMiddleware');
 const { logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
@@ -58,7 +59,7 @@ function attachGuards(ws, pathForLimits) {
     let intervalMs = 10_000; // per 10 seconds
     if (pathForLimits && pathForLimits.startsWith('/editor/')) {
         capacity = 200; // editors can be chatty
-    } else if (pathForLimits === '/handleChat') {
+    } else if (pathForLimits === '/handleChat' || pathForLimits === '/call-center/chat') {
         capacity = 100; // chats can be active
     }
     ws._rate = createRateLimiter(capacity, intervalMs);
@@ -134,6 +135,9 @@ function setupWebSocketServer(webSocketServer) {
                     break;
                 case '/handleChat': // Added new case for chat
                     handleChat(ws, user, request);
+                    break;
+                case '/call-center/chat':
+                    handleCallCenter(ws, user, request);
                     break;
                 default:
                     // Check if it's an editor route

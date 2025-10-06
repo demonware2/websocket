@@ -3,6 +3,7 @@ require('./app/Function/botHandler');
 const http = require('http');
 const WebSocket = require('ws');
 const { setupWebSocketServer } = require('./websocketServer');
+const { startCallCenterPersistence } = require('./app/Function/callCenterPersistence');
 const { verifyAuthentication } = require('./app/Helper/authMiddleware');
 const { AuthenticationError ,setupErrorHandlers , handleError, logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
 const { handleRequestHttp } = require('./requestServer');
@@ -19,6 +20,7 @@ const wss = new WebSocket.Server({
 });
 
 setupWebSocketServer(wss);
+const callCenterPersistence = startCallCenterPersistence();
 
 server.on('upgrade', async function upgrade(request, socket, head) {
     logDebug(`WebSocket upgrade request from ${socket.remoteAddress} to ${request.url}`);
@@ -104,6 +106,7 @@ try {
     ['SIGINT', 'SIGTERM', 'SIGQUIT'].forEach(sig => {
         process.on(sig, () => {
             try { editorHandler.cleanup(); } catch (_) {}
+            try { callCenterPersistence.stop(); } catch (_) {}
         });
     });
 } catch (_) {

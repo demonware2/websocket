@@ -68,6 +68,19 @@ function extractIPv4FromMapped(ip) {
     return match ? match[1] : ip;
 }
 
+function matchesRoutePattern(pattern, path) {
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+        return false;
+    }
+
+    if (pattern.endsWith('*')) {
+        const prefix = pattern.slice(0, -1);
+        return path.startsWith(prefix);
+    }
+
+    return pattern === path;
+}
+
 function normalizeIP(ip) {
     if (!isValidIP(ip)) {
         throw new Error('Invalid IP address');
@@ -236,7 +249,12 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
         return authResult;
     } catch (error) {
-        logWarning('Authentication error', { error: error.message });
+        logWarning('Authentication error', {
+            error: error.message,
+            stack: error.stack,
+            pathname,
+            typeRequest,
+        });
         return null;
     }
 }
@@ -263,22 +281,33 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
             throw new AuthenticationError('Invalid request type', `Invalid request type for user ${decoded.userId}`);
         }
 
-        let userRoles = getUserRolesFromCache(decoded.userId);
+        const isCallCenterCustomer = cleanRequestedPath === '/call-center/chat'
+            && decoded.callCenter
+            && decoded.callCenter.role === 'customer';
 
-        if (!userRoles) {
-            try {
-                userRoles = await getUserRolesFromDatabase(decoded.userId);
-                if (userRoles) {
-                    setUserRolesToCache(decoded.userId, userRoles);
-                } else {
-                    userRoles = [1];
-                    logDebug(`Using default role`, { userId: decoded.userId });
-                }
-            } catch (dbError) {
-                logWarning('Database not available, using default role');
-                userRoles = [1];
-            }
+        if (isCallCenterCustomer) {
+            const sessionId = Number(decoded.callCenter.sessionId || 0);
+            const authResult = {
+                ...decoded,
+                callCenterInternal: {
+                    sessionUuid: decoded.callCenter.sessionUuid,
+                    sessionId,
+                    role: 'customer',
+                },
+                roleId: null,
+                roles: [],
+            };
+
+            logInfo('Call center customer token accepted', {
+                userId: decoded.userId,
+                sessionId,
+            });
+
+            return authResult;
         }
+
+        const publicRoutes = Array.isArray(roleConfig.publicRoutes) ? roleConfig.publicRoutes : [];
+        const isPublicRoute = publicRoutes.some((pattern) => matchesRoutePattern(pattern, cleanRequestedPath));
 
         let requiredRoles = roleConfig.routes[cleanRequestedPath];
 
@@ -286,26 +315,107 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
             requiredRoles = roleConfig.routes['/editor'];
         }
 
-        if (!requiredRoles) {
-            const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat', '/handleWhatsapp'];
+        if (!requiredRoles && !isPublicRoute) {
+            const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat', '/handleWhatsapp', '/call-center/chat'];
             if (!allowedPaths.includes(cleanRequestedPath)) {
                 throw new AuthenticationError('Route not configured', `Route not configured: ${cleanRequestedPath}`);
             }
             requiredRoles = [1];
         }
 
-        if (!userRoles.some(role => requiredRoles.includes(parseInt(role)))) {
-            throw new AuthenticationError('Insufficient permissions', `Insufficient permissions for user ${decoded.userId} on path ${cleanRequestedPath}`);
+        const requiresRoleCheck = !isPublicRoute && Array.isArray(requiredRoles) && requiredRoles.length > 0;
+
+        const tokenRolesRaw = Array.isArray(decoded.roles) ? decoded.roles : [];
+        const tokenRoles = tokenRolesRaw
+            .map((role) => {
+                if (typeof role === 'object' && role !== null) {
+                    if (Object.prototype.hasOwnProperty.call(role, 'role_id') && isFinite(role.role_id)) {
+                        return parseInt(role.role_id, 10);
+                    }
+                    if (Object.prototype.hasOwnProperty.call(role, 'id') && isFinite(role.id)) {
+                        return parseInt(role.id, 10);
+                    }
+                }
+                if (typeof role === 'string' && role.trim() === '') {
+                    return null;
+                }
+                const parsed = parseInt(role, 10);
+                return Number.isNaN(parsed) ? null : parsed;
+            })
+            .filter((value) => Number.isInteger(value));
+
+        let userRoles = tokenRoles.length > 0 ? [...new Set(tokenRoles)] : null;
+
+        if (requiresRoleCheck) {
+            if (userRoles) {
+                logDebug('Roles provided by token', {
+                    userId: decoded.userId,
+                    roleCount: userRoles.length,
+                });
+            } else {
+                userRoles = getUserRolesFromCache(decoded.userId);
+
+                logDebug('Role cache lookup', {
+                    userId: decoded.userId,
+                    cacheHit: !!userRoles,
+                });
+
+                if (!userRoles) {
+                    try {
+                        userRoles = await getUserRolesFromDatabase(decoded.userId);
+                        if (userRoles && userRoles.length > 0) {
+                            userRoles = userRoles.map((role) => parseInt(role, 10)).filter((value) => Number.isInteger(value));
+                            setUserRolesToCache(decoded.userId, userRoles);
+                        } else {
+                            userRoles = [1];
+                            logDebug('Using default role', { userId: decoded.userId });
+                        }
+                    } catch (dbError) {
+                        logWarning('Database not available, using default role');
+                        userRoles = [1];
+                    }
+                }
+            }
+
+            if (!userRoles.some((role) => requiredRoles.includes(parseInt(role, 10)))) {
+                throw new AuthenticationError('Insufficient permissions', `Insufficient permissions for user ${decoded.userId} on path ${cleanRequestedPath}`);
+            }
+        } else {
+            userRoles = userRoles ? userRoles : [];
+            if (userRoles.length > 0) {
+                logDebug('Public route roles preserved from token', {
+                    userId: decoded.userId,
+                    roleCount: userRoles.length,
+                });
+            }
         }
 
         const currentTime = Math.floor(Date.now() / 1000);
-        if (!skipRedisChecks && decoded.exp - currentTime < 300) {
+        if (requiresRoleCheck && userRoles.length > 0 && !skipRedisChecks && decoded.exp - currentTime < 300) {
             return await updateToken(decoded, userRoles[0]);
         }
 
+        const primaryRoleId = userRoles.length > 0 ? userRoles[0] : null;
+        const authResult = { ...decoded, roleId: primaryRoleId, roles: userRoles };
+
+        if (cleanRequestedPath === '/call-center/chat') {
+            authResult.callCenterInternal = { role: 'agent' };
+            logInfo('Call center agent token accepted', {
+                userId: decoded.userId,
+                roles: userRoles,
+            });
+            return authResult;
+        }
+
         logInfo(`Token verified for user ${decoded.userId} on path ${cleanRequestedPath}`);
-        return { ...decoded, roleId: userRoles[0] };
+
+        return authResult;
     } catch (error) {
+        logWarning('verifyToken error', {
+            path: cleanRequestedPath,
+            message: error.message,
+            stack: error.stack,
+        });
         throw error;
     }
 }
