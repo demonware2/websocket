@@ -1,5 +1,6 @@
 const Redis = require('ioredis');
 const mysql = require('mysql2/promise');
+const crypto = require('crypto');
 const { logInfo, logError, logWarning } = require('../Helper/errorHandler');
 
 const CALL_CENTER_TIMEZONE = process.env.CALL_CENTER_TIMEZONE || process.env.TZ || 'Asia/Jakarta';
@@ -15,6 +16,14 @@ const QUEUE_LENGTH_SAMPLE_INTERVAL = Math.max(Number(process.env.CALL_CENTER_QUE
 const EXPIRY_KEY_PREFIX = process.env.CALL_CENTER_EXPIRY_KEY_PREFIX || 'callcenter:session:expiry:';
 const EXPIRY_DB = Number(process.env.CALL_CENTER_EXPIRY_DB || 3);
 const SESSION_INACTIVITY_TTL = Number(process.env.CALL_CENTER_INACTIVE_TIMEOUT_SECONDS || 900);
+const PRIMARY_ATTACHMENT_SECRET = process.env.LIVECHAT_ATTACHMENT_SECRET
+    || process.env.ENCRYPTION_KEY
+    || 'livechat-secret';
+
+const ATTACHMENT_SECRETS = [
+    PRIMARY_ATTACHMENT_SECRET,
+    process.env.ENCRYPTION_KEY,
+].filter((value, index, array) => typeof value === 'string' && value.length > 0 && array.indexOf(value) === index);
 
 const DAY_INDEX = {
     sun: 0,
@@ -58,6 +67,26 @@ function normaliseSchedule(schedule = []) {
             };
         })
         .filter(Boolean);
+}
+
+function buildAttachmentToken(sessionId, filePath) {
+    if (!sessionId || !filePath) {
+        return null;
+    }
+
+    try {
+        return crypto
+            .createHmac('sha256', PRIMARY_ATTACHMENT_SECRET)
+            .update(`${sessionId}|${filePath}`)
+            .digest('hex');
+    } catch (error) {
+        logWarning('Failed to build attachment token', {
+            sessionId,
+            filePath,
+            error: error.message,
+        });
+        return null;
+    }
 }
 
 function isWithinSchedule(settings) {
@@ -179,8 +208,59 @@ function normalizeTimestamp(value, timezone = CALL_CENTER_TIMEZONE) {
     return formatDateToTimezone(date, timezone);
 }
 
-async function persistMessage(pool, message) {
+async function persistMessage(pool, publisher, message) {
     const createdAt = normalizeTimestamp(message.createdAt);
+
+    const attachmentsInput = [];
+    if (Array.isArray(message.attachments)) {
+        message.attachments.forEach((item) => attachmentsInput.push(item));
+    }
+    if (message.attachment) {
+        attachmentsInput.push(message.attachment);
+    }
+
+    const attachmentsPresent = attachmentsInput.length > 0;
+    const normalizedContent = (() => {
+        if (typeof message.content === 'string' && message.content.trim() !== '') {
+            return message.content;
+        }
+
+        if (!attachmentsPresent) {
+            return '';
+        }
+
+        const primaryAttachment = attachmentsInput[0] || {};
+        return (
+            primaryAttachment.original_name
+            || primaryAttachment.file_name
+            || primaryAttachment.fileName
+            || '(Lampiran)'
+        );
+    })();
+
+    const normalizedMessageType = (() => {
+        const declaredType = typeof message.messageType === 'string' && message.messageType.trim() !== ''
+            ? message.messageType
+            : null;
+
+        if (declaredType) {
+            return declaredType;
+        }
+
+        return attachmentsPresent ? 'attachment' : 'text';
+    })();
+
+    let primaryAttachmentId = null;
+    const linkedAttachmentIds = [];
+
+    for (const attachment of attachmentsInput) {
+        const candidateId = Number(attachment.id || attachment.attachmentId || 0);
+        if (candidateId > 0) {
+            primaryAttachmentId = candidateId;
+            linkedAttachmentIds.push(candidateId);
+            break;
+        }
+    }
 
     const connection = await pool.getConnection();
     try {
@@ -191,12 +271,12 @@ async function persistMessage(pool, message) {
                 message.sessionId,
                 message.senderType,
                 message.senderId,
-                message.messageType || 'text',
-                message.content,
+                normalizedMessageType,
+                normalizedContent,
                 message.metadata ? JSON.stringify(message.metadata) : null,
                 createdAt,
                 createdAt,
-                message.attachment ? message.attachment.id : null,
+                primaryAttachmentId,
                 message.sessionId,
             ],
         );
@@ -206,27 +286,111 @@ async function persistMessage(pool, message) {
             return;
         }
 
-        if (message.attachment) {
+        let resolvedAttachmentId = primaryAttachmentId;
+        if (attachmentsInput.length) {
+            for (const attachment of attachmentsInput) {
+                const attachmentId = Number(attachment.id || attachment.attachmentId || 0);
+
+                if (attachmentId) {
+                    await connection.execute(
+                        'UPDATE call_center_attachments SET message_id = ?, updated_at = ?, metadata = COALESCE(?, metadata) WHERE id = ?',
+                        [
+                            insertResult.insertId,
+                            normalizeTimestamp(attachment.updated_at || attachment.created_at || createdAt),
+                            attachment.metadata ? JSON.stringify(attachment.metadata) : null,
+                            attachmentId,
+                        ],
+                    );
+                    linkedAttachmentIds.push(attachmentId);
+                    if (!resolvedAttachmentId) {
+                        resolvedAttachmentId = attachmentId;
+                    }
+                } else {
+                    const [attachmentResult] = await connection.execute(
+                        'INSERT INTO call_center_attachments (session_id, message_id, original_name, stored_name, mime_type, file_path, file_size, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        [
+                            message.sessionId,
+                            insertResult.insertId,
+                            attachment.original_name || attachment.fileName || attachment.name || '-',
+                            attachment.stored_name || attachment.filePath || attachment.path || '',
+                            attachment.mime_type || attachment.mimeType || 'application/octet-stream',
+                            attachment.file_path || attachment.filePath || attachment.path || '',
+                            attachment.file_size || attachment.fileSize || 0,
+                            attachment.metadata ? JSON.stringify(attachment.metadata) : null,
+                            normalizeTimestamp(attachment.created_at || createdAt),
+                            normalizeTimestamp(attachment.updated_at || createdAt),
+                        ],
+                    );
+                    if (!resolvedAttachmentId && attachmentResult && attachmentResult.insertId) {
+                        resolvedAttachmentId = Number(attachmentResult.insertId);
+                    }
+                    if (attachmentResult && attachmentResult.insertId) {
+                        const newId = Number(attachmentResult.insertId);
+                        linkedAttachmentIds.push(newId);
+                        attachment.attachmentId = newId;
+                        attachment.id = newId;
+                    }
+                }
+            }
+        }
+
+        if (resolvedAttachmentId && resolvedAttachmentId !== primaryAttachmentId) {
             await connection.execute(
-                'INSERT INTO call_center_attachments (session_id, message_id, original_name, stored_name, mime_type, file_path, file_size, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [
-                    message.sessionId,
-                    insertResult.insertId,
-                    message.attachment.original_name,
-                    message.attachment.stored_name,
-                    message.attachment.mime_type,
-                    message.attachment.file_path,
-                    message.attachment.file_size,
-                    message.attachment.metadata ? JSON.stringify(message.attachment.metadata) : null,
-                    normalizeTimestamp(message.attachment.created_at || createdAt),
-                    normalizeTimestamp(message.attachment.updated_at || createdAt),
-                ],
+                'UPDATE call_center_messages SET attachment_id = ? WHERE id = ?',
+                [resolvedAttachmentId, insertResult.insertId],
             );
         }
 
         await connection.execute(
             'UPDATE call_center_sessions SET last_message_at = ?, status = IF(status = "pending", "open", status), updated_at = ? WHERE id = ?',
             [createdAt, createdAt, message.sessionId],
+        );
+
+        const uniqueAttachmentIds = Array.from(new Set(linkedAttachmentIds.filter((id) => Number.isFinite(id) && id > 0)));
+
+        const persistedEvent = {
+            kind: 'message_persisted',
+            sessionId: message.sessionId,
+            messageUuid: message.id,
+            clientMessageId: message.id,
+            messageId: insertResult.insertId,
+            id: insertResult.insertId,
+            attachmentIds: uniqueAttachmentIds,
+            sourceNode: 'callcenter:persistence',
+        };
+
+        if (attachmentsInput.length) {
+            persistedEvent.attachments = attachmentsInput
+                .map((item) => {
+                    const attachmentId = Number(item.attachmentId || item.id || 0);
+                    if (!Number.isFinite(attachmentId) || attachmentId <= 0) {
+                        return null;
+                    }
+
+                    const filePath = item.file_path || item.filePath || item.path || '';
+                    const incomingToken = typeof item.downloadToken === 'string'
+                        ? item.downloadToken
+                        : (typeof item.token === 'string' ? item.token : null);
+
+                    const token = incomingToken || (filePath ? buildAttachmentToken(message.sessionId, filePath) : null);
+
+                    return {
+                        attachmentId,
+                        id: attachmentId,
+                        fileName: item.file_name || item.fileName || null,
+                        filePath,
+                        fileSize: Number(item.file_size || item.fileSize || 0),
+                        mimeType: item.mime_type || item.mimeType || 'application/octet-stream',
+                        token,
+                        downloadToken: token,
+                    };
+                })
+                .filter((item) => item && item.attachmentId);
+        }
+
+        await publisher.publish(
+            `callcenter:session:${message.sessionId}`,
+            JSON.stringify(persistedEvent),
         );
     } finally {
         connection.release();
@@ -462,7 +626,7 @@ function startCallCenterPersistence() {
                     });
 
                     try {
-                        await persistMessage(mysqlPool, payload.payload);
+                        await persistMessage(mysqlPool, eventPublisher, payload.payload);
                         logInfo('Call center persistence: message persisted', {
                             messageId: payload.payload.id,
                             sessionId: payload.payload.sessionId,

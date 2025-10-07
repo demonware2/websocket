@@ -11,7 +11,7 @@ const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler');
 const { handleWhatsapp } = require('./app/Function/whatsappHandler');
-const { handleCallCenter } = require('./app/Function/callCenterHandler');
+const { handleCallCenter, handleCallCenterAdminBroadcast } = require('./app/Function/callCenterHandler');
 const { startCallCenterPersistence } = require('./app/Function/callCenterPersistence');
 
 const PORT = parseInt(process.env.PORT) || 9950;
@@ -479,12 +479,18 @@ function handleOtherConnections(ws, user, pathname, connectionId, request) {
             case '/call-center/chat':
                 handleCallCenterWrapper(ws, user, connectionId);
                 break;
+            case '/call-center/admin/broadcast':
+                handleCallCenterAdminBroadcastWrapper(ws, user, connectionId);
+                break;
             default:
                 ws.send(JSON.stringify({
                     type: 'connected',
                     message: `Connected to ${pathname}`,
                     user: user.userId
                 }));
+                ws.on('close', () => {
+                    handleDisconnection(connectionId);
+                });
         }
     } catch (error) {
         handleError(error, 'handleOtherConnections');
@@ -618,6 +624,17 @@ function handleCallCenterWrapper(ws, user, connectionId) {
         });
     } catch (error) {
         handleError(error, 'handleCallCenterWrapper');
+    }
+}
+
+function handleCallCenterAdminBroadcastWrapper(ws, user, connectionId) {
+    try {
+        handleCallCenterAdminBroadcast(ws, user);
+        ws.on('close', () => {
+            handleDisconnection(connectionId);
+        });
+    } catch (error) {
+        handleError(error, 'handleCallCenterAdminBroadcastWrapper');
     }
 }
 

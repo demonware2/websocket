@@ -2,6 +2,7 @@ const Redis = require('ioredis');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const os = require('os');
+const crypto = require('crypto');
 
 const { logInfo, logError, logWarning } = require('../Helper/errorHandler');
 
@@ -20,6 +21,44 @@ const EXPIRY_KEY_PREFIX = process.env.CALL_CENTER_EXPIRY_KEY_PREFIX || 'callcent
 
 const expiryRedis = SESSION_INACTIVITY_TTL > 0 ? new Redis({ ...redisConfig, db: EXPIRY_DB }) : null;
 const expirySubscriber = SESSION_INACTIVITY_TTL > 0 ? new Redis({ ...redisConfig, db: EXPIRY_DB }) : null;
+
+const PRIMARY_ATTACHMENT_SECRET = process.env.LIVECHAT_ATTACHMENT_SECRET
+    || process.env.ENCRYPTION_KEY
+    || 'livechat-secret';
+
+const ATTACHMENT_SECRETS = [
+    PRIMARY_ATTACHMENT_SECRET,
+    process.env.ENCRYPTION_KEY,
+].filter((value, index, array) => typeof value === 'string' && value.length > 0 && array.indexOf(value) === index);
+
+function buildAttachmentTokenWithSecret(secret, sessionId, filePath) {
+    const effectiveSecret = secret || 'livechat-secret';
+
+    return crypto
+        .createHmac('sha256', effectiveSecret)
+        .update(`${sessionId}|${filePath}`)
+        .digest('hex');
+}
+
+function verifyAttachmentToken(sessionId, filePath, token) {
+    if (!token || !filePath) {
+        return false;
+    }
+
+    return ATTACHMENT_SECRETS.some((secret) => {
+        try {
+            const expected = buildAttachmentTokenWithSecret(secret, sessionId, filePath);
+            return expected === token;
+        } catch (error) {
+            logWarning('Failed to compute attachment token', {
+                error: error.message,
+                sessionId,
+                filePath,
+            });
+            return false;
+        }
+    });
+}
 
 if (expiryRedis) {
     expiryRedis.on('error', (error) => {
@@ -248,22 +287,75 @@ function handleInboundMessage(ws, meta, raw) {
             });
             break;
         case 'message': {
-            const content = typeof data.content === 'string' ? data.content.trim() : '';
-            if (!content) {
+            const rawContent = typeof data.content === 'string' ? data.content : '';
+            const attachmentsInput = Array.isArray(data.attachments) ? data.attachments : [];
+
+            const attachments = attachmentsInput.reduce((list, attachment) => {
+                if (!attachment || typeof attachment !== 'object') {
+                    return list;
+                }
+
+                const attachmentId = Number(attachment.attachmentId || attachment.id || 0);
+                const fileName = typeof attachment.fileName === 'string' ? attachment.fileName : null;
+                const downloadToken = typeof attachment.downloadToken === 'string' ? attachment.downloadToken : (typeof attachment.token === 'string' ? attachment.token : null);
+                const filePath = typeof attachment.filePath === 'string' ? attachment.filePath : null;
+
+                if (!attachmentId || !fileName || !downloadToken || !filePath) {
+                    logWarning('Attachment payload missing required fields for message', { attachment });
+                    return list;
+                }
+
+                const isTokenValid = verifyAttachmentToken(sessionId, filePath, downloadToken);
+                const normalizedToken = buildAttachmentTokenWithSecret(PRIMARY_ATTACHMENT_SECRET, sessionId, filePath);
+
+                if (!isTokenValid) {
+                    logWarning('Attachment download token mismatch (message)', {
+                        sessionId,
+                        attachmentId,
+                    });
+                }
+
+                list.push({
+                    id: attachmentId,
+                    attachmentId,
+                    fileName,
+                    fileSize: Number(attachment.fileSize || attachment.file_size || 0),
+                    mimeType: attachment.mimeType || attachment.mime_type || 'application/octet-stream',
+                    downloadToken: normalizedToken,
+                    token: normalizedToken,
+                    filePath,
+                    metadata: attachment.metadata && typeof attachment.metadata === 'object' ? attachment.metadata : {},
+                });
+
+                return list;
+            }, []);
+
+            const hasText = rawContent.trim().length > 0;
+
+            if (!hasText && attachments.length === 0) {
                 return;
             }
 
             const timestamp = new Date().toISOString();
+            const clientMessageId = uuidv4();
+
+            const fallbackContent = hasText ? rawContent : (attachments[0]?.fileName || '(Lampiran)');
+
             const message = {
-                id: uuidv4(),
+                id: clientMessageId,
+                clientMessageId,
+                messageUuid: clientMessageId,
+                messageId: clientMessageId,
                 sessionId,
                 sessionUuid,
                 senderType: role === 'agent' ? 'admin' : 'customer',
                 senderId: role === 'agent' ? actorId : null,
-                messageType: 'text',
-                content,
+                messageType: hasText ? 'text' : 'attachment',
+                content: fallbackContent,
                 createdAt: timestamp,
             };
+
+            message.attachments = attachments;
 
             queueForPersistence({
                 action: 'message',
@@ -274,6 +366,81 @@ function handleInboundMessage(ws, meta, raw) {
                 type: 'callcenter:event',
                 payload: {
                     kind: 'message',
+                    message,
+                },
+            };
+
+            broadcastToSession(sessionId, outbound);
+            publishRealtime(sessionId, outbound.payload);
+            refreshSessionExpiry(sessionId);
+            break;
+        }
+        case 'attachment': {
+            const attachment = data.attachment;
+            if (!attachment || typeof attachment !== 'object') {
+                return;
+            }
+
+            const attachmentId = Number(attachment.attachmentId || attachment.id || 0);
+            const fileName = typeof attachment.fileName === 'string' ? attachment.fileName : null;
+            const fileSize = Number(attachment.fileSize || 0);
+            const mimeType = typeof attachment.mimeType === 'string' ? attachment.mimeType : 'application/octet-stream';
+            const downloadToken = typeof attachment.downloadToken === 'string' ? attachment.downloadToken : null;
+            const filePath = typeof attachment.filePath === 'string' ? attachment.filePath : null;
+            const metadata = attachment.metadata && typeof attachment.metadata === 'object' ? attachment.metadata : {};
+
+            if (!attachmentId || !fileName || !downloadToken || !filePath) {
+                logWarning('Attachment payload missing required fields', { payload: attachment });
+                return;
+            }
+
+            const isTokenValid = verifyAttachmentToken(sessionId, filePath, downloadToken);
+            const normalizedToken = buildAttachmentTokenWithSecret(PRIMARY_ATTACHMENT_SECRET, sessionId, filePath);
+
+            if (!isTokenValid) {
+                logWarning('Attachment download token mismatch', {
+                    sessionId,
+                    attachmentId,
+                });
+            }
+
+            const timestamp = new Date().toISOString();
+            const clientMessageId = uuidv4();
+            const message = {
+                id: clientMessageId,
+                clientMessageId,
+                messageUuid: clientMessageId,
+                messageId: clientMessageId,
+                sessionId,
+                sessionUuid,
+                senderType: role === 'agent' ? 'admin' : 'customer',
+                senderId: role === 'agent' ? actorId : null,
+                messageType: 'attachment',
+                content: fileName,
+                createdAt: timestamp,
+                attachment: {
+                    id: attachmentId,
+                    fileName,
+                    fileSize,
+                    mimeType,
+                    downloadToken: normalizedToken,
+                    token: normalizedToken,
+                    filePath,
+                    metadata,
+                },
+            };
+
+            message.attachments = [message.attachment];
+
+            queueForPersistence({
+                action: 'message',
+                payload: message,
+            });
+
+            const outbound = {
+                type: 'callcenter:event',
+                payload: {
+                    kind: 'attachment',
                     message,
                 },
             };
@@ -339,6 +506,22 @@ function subscribeRealtimeChannel() {
 
         const entry = sessionConnections.get(sessionId);
 
+        if (payload.kind === 'message_persisted') {
+            if (entry) {
+                broadcastToSession(sessionId, {
+                    type: 'callcenter:event',
+                    payload,
+                });
+            }
+
+            emitMonitorEvent('message_persisted', {
+                sessionId,
+                messageId: payload.messageId || null,
+            });
+
+            return;
+        }
+
         if (payload.kind === 'session_created') {
             emitMonitorEvent('session_created', {
                 sessionId,
@@ -356,6 +539,11 @@ function subscribeRealtimeChannel() {
                 sessionId,
                 reason: payload.reason || null,
                 source: payload.sourceNode || null,
+            });
+        } else if (payload.kind === 'upload_permission') {
+            emitMonitorEvent('upload_permission', {
+                sessionId,
+                allow: !!payload.allow,
             });
         }
 
@@ -376,6 +564,11 @@ function subscribeRealtimeChannel() {
                 try { client.close(1000, 'Session closed'); } catch (_) {}
             });
             sessionConnections.delete(sessionId);
+        } else if (payload.kind === 'upload_permission') {
+            broadcastToSession(sessionId, {
+                type: 'callcenter:event',
+                payload,
+            });
         }
     });
 }
