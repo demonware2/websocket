@@ -2,9 +2,11 @@ const Redis = require('ioredis');
 const mysql = require('mysql2/promise');
 const { logInfo, logError, logWarning } = require('../Helper/errorHandler');
 
+const CALL_CENTER_TIMEZONE = process.env.CALL_CENTER_TIMEZONE || process.env.TZ || 'Asia/Jakarta';
+
 const DEFAULT_SETTINGS = {
     enabled: true,
-    timezone: process.env.CALL_CENTER_TIMEZONE || 'Asia/Jakarta',
+    timezone: CALL_CENTER_TIMEZONE,
     schedule: [],
 };
 
@@ -118,15 +120,63 @@ function createMysqlPool() {
     });
 }
 
-function normalizeTimestamp(value) {
-    const raw = value && String(value).trim() !== '' ? value : null;
-    const date = raw ? new Date(raw) : new Date();
+function formatDateToTimezone(date, timezone) {
+    try {
+        const formatter = new Intl.DateTimeFormat('en-GB', {
+            timeZone: timezone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+        });
 
-    if (Number.isNaN(date.getTime())) {
-        return new Date().toISOString().slice(0, 19).replace('T', ' ');
+        const parts = formatter.formatToParts(date);
+        const getPart = (type) => {
+            const part = parts.find((entry) => entry.type === type);
+            return part ? part.value : null;
+        };
+
+        const year = getPart('year');
+        const month = getPart('month');
+        const day = getPart('day');
+        const hour = getPart('hour');
+        const minute = getPart('minute');
+        const second = getPart('second');
+
+        if ([year, month, day, hour, minute, second].some((part) => typeof part !== 'string')) {
+            const fallback = date.toLocaleString('sv-SE', { timeZone: timezone, hour12: false });
+            return fallback.replace('T', ' ');
+        }
+
+        return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+    } catch (_) {
+        const fallback = date.toLocaleString('sv-SE', { timeZone: timezone, hour12: false });
+        return fallback.replace('T', ' ');
+    }
+}
+
+function normalizeTimestamp(value, timezone = CALL_CENTER_TIMEZONE) {
+    let date;
+
+    if (value instanceof Date) {
+        date = value;
+    } else if (typeof value === 'number') {
+        date = new Date(value);
+    } else if (value && typeof value === 'string' && value.trim() !== '') {
+        const parsed = new Date(value);
+        date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+    } else {
+        date = new Date();
     }
 
-    return date.toISOString().slice(0, 19).replace('T', ' ');
+    if (Number.isNaN(date.getTime())) {
+        date = new Date();
+    }
+
+    return formatDateToTimezone(date, timezone);
 }
 
 async function persistMessage(pool, message) {
