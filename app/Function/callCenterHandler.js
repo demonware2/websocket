@@ -14,10 +14,129 @@ const realtimePublisher = new Redis(redisConfig);
 const realtimeSubscriber = new Redis(redisConfig);
 const persistenceRedis = new Redis({ ...redisConfig, db: 2 });
 
+const EXPIRY_DB = Number(process.env.CALL_CENTER_EXPIRY_DB || 3);
+const SESSION_INACTIVITY_TTL = Number(process.env.CALL_CENTER_INACTIVE_TIMEOUT_SECONDS || 900);
+const EXPIRY_KEY_PREFIX = process.env.CALL_CENTER_EXPIRY_KEY_PREFIX || 'callcenter:session:expiry:';
+
+const expiryRedis = SESSION_INACTIVITY_TTL > 0 ? new Redis({ ...redisConfig, db: EXPIRY_DB }) : null;
+const expirySubscriber = SESSION_INACTIVITY_TTL > 0 ? new Redis({ ...redisConfig, db: EXPIRY_DB }) : null;
+
+if (expiryRedis) {
+    expiryRedis.on('error', (error) => {
+        logWarning('Call center expiry redis error', { error: error.message });
+    });
+}
+
+if (expirySubscriber) {
+    expirySubscriber.on('error', (error) => {
+        logWarning('Call center expiry subscriber error', { error: error.message });
+    });
+}
+
 const NODE_ID = `${os.hostname()}-${process.pid}`;
 
 const sessionConnections = new Map();
 const connectionMeta = new Map();
+
+const INACTIVITY_TTL_SECONDS = SESSION_INACTIVITY_TTL > 0 ? Math.max(SESSION_INACTIVITY_TTL, 30) : 0;
+
+function refreshSessionExpiry(sessionId) {
+    if (!expiryRedis || !sessionId || INACTIVITY_TTL_SECONDS <= 0) {
+        return;
+    }
+
+    expiryRedis
+        .set(`${EXPIRY_KEY_PREFIX}${sessionId}`, Date.now().toString(), 'EX', INACTIVITY_TTL_SECONDS)
+        .catch((error) => {
+            logWarning('Failed to refresh session inactivity TTL', { error: error.message, sessionId });
+        });
+}
+
+function clearSessionExpiry(sessionId) {
+    if (!expiryRedis || !sessionId) {
+        return;
+    }
+
+    expiryRedis
+        .del(`${EXPIRY_KEY_PREFIX}${sessionId}`)
+        .catch((error) => {
+            logWarning('Failed to clear session inactivity TTL', { error: error.message, sessionId });
+        });
+}
+
+async function ensureExpiryNotificationSupport() {
+    if (!expiryRedis || INACTIVITY_TTL_SECONDS <= 0) {
+        return;
+    }
+
+    try {
+        const configResult = await expiryRedis.config('GET', 'notify-keyspace-events');
+        const currentValue = Array.isArray(configResult) ? configResult[1] || '' : '';
+        let desiredValue = typeof currentValue === 'string' ? currentValue : '';
+
+        if (!desiredValue.includes('E')) {
+            desiredValue += 'E';
+        }
+        if (!desiredValue.includes('x')) {
+            desiredValue += 'x';
+        }
+
+        if (desiredValue !== currentValue) {
+            await expiryRedis.config('SET', 'notify-keyspace-events', desiredValue);
+        }
+    } catch (error) {
+        logWarning('Unable to configure Redis keyspace notifications', { error: error.message });
+        throw error;
+    }
+}
+
+function subscribeExpiryEvents() {
+    if (!expirySubscriber || INACTIVITY_TTL_SECONDS <= 0) {
+        return;
+    }
+
+    const channel = `__keyevent@${EXPIRY_DB}__:expired`;
+
+    expirySubscriber.subscribe(channel, (error) => {
+        if (error) {
+            logWarning('Failed subscribing to inactivity expiry channel', { error: error.message });
+        }
+    });
+
+    expirySubscriber.on('message', (_channel, key) => {
+        if (typeof key !== 'string' || !key.startsWith(EXPIRY_KEY_PREFIX)) {
+            return;
+        }
+
+        const sessionId = Number(key.slice(EXPIRY_KEY_PREFIX.length));
+        if (!Number.isFinite(sessionId) || sessionId <= 0) {
+            return;
+        }
+
+        queueForPersistence({
+            action: 'expire',
+            payload: {
+                sessionId,
+                reason: 'inactivity',
+                emittedAt: new Date().toISOString(),
+            },
+        }).catch((error) => {
+            logError('Failed to enqueue inactivity expiration', { error: error.message, sessionId });
+        });
+    });
+}
+
+function initExpiryMonitor() {
+    if (!expiryRedis || !expirySubscriber || INACTIVITY_TTL_SECONDS <= 0) {
+        return;
+    }
+
+    ensureExpiryNotificationSupport()
+        .catch(() => {})
+        .finally(() => {
+            subscribeExpiryEvents();
+        });
+}
 
 function ensureSessionEntry(sessionId) {
     if (!sessionConnections.has(sessionId)) {
@@ -88,6 +207,7 @@ function handleInboundMessage(ws, meta, raw) {
     switch (data.type) {
         case 'ping':
             ws.send(JSON.stringify({ type: 'pong', at: Date.now() }));
+            refreshSessionExpiry(sessionId);
             break;
         case 'typing':
             publishRealtime(sessionId, {
@@ -129,6 +249,7 @@ function handleInboundMessage(ws, meta, raw) {
 
             broadcastToSession(sessionId, outbound);
             publishRealtime(sessionId, outbound.payload);
+            refreshSessionExpiry(sessionId);
             break;
         }
         default:
@@ -192,6 +313,7 @@ function subscribeRealtimeChannel() {
         broadcastToSession(sessionId, outbound);
 
         if (payload.kind === 'session_closed') {
+            clearSessionExpiry(sessionId);
             [...entry.agents, ...entry.customers].forEach((client) => {
                 try { client.close(1000, 'Session closed'); } catch (_) {}
             });
@@ -201,6 +323,7 @@ function subscribeRealtimeChannel() {
 }
 
 subscribeRealtimeChannel();
+initExpiryMonitor();
 
 function handleCallCenter(ws, user) {
     const callCenterData = user.callCenter;
@@ -230,6 +353,8 @@ function handleCallCenter(ws, user) {
         userId,
         actorId,
     });
+
+    refreshSessionExpiry(sessionId);
 
     ws.on('message', (raw) => handleInboundMessage(ws, connectionMeta.get(ws), raw));
     ws.on('close', () => cleanupConnection(ws));

@@ -20,10 +20,17 @@ const dbConfig = {
   timeout: 60000
 };
 
+const pool = mysql.createPool({
+  ...dbConfig,
+  waitForConnections: true,
+  connectionLimit: Number(process.env.CHAT_DB_POOL || 4),
+  queueLimit: 0
+});
+
 let stopping = false;
 
 async function persistMessage(msg) {
-  const connection = await mysql.createConnection(dbConfig);
+  const connection = await pool.getConnection();
   try {
     await connection.execute(
       'INSERT INTO chat_messages (id, type, sender_id, recipient_id, group_id, content, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -38,7 +45,7 @@ async function persistMessage(msg) {
       ]
     );
   } finally {
-    await connection.end();
+    connection.release();
   }
 }
 
@@ -66,6 +73,7 @@ async function run() {
   }
   logInfo('Chat persistence worker stopping');
   try { await redis.quit(); } catch (_) {}
+  try { await pool.end(); } catch (_) {}
 }
 
 ['SIGINT', 'SIGTERM', 'SIGQUIT'].forEach(sig => {
@@ -78,4 +86,3 @@ run().catch(err => {
   logError('Fatal worker error', { error: err.message });
   process.exit(1);
 });
-

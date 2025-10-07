@@ -11,6 +11,8 @@ const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler');
 const { handleWhatsapp } = require('./app/Function/whatsappHandler');
+const { handleCallCenter } = require('./app/Function/callCenterHandler');
+const { startCallCenterPersistence } = require('./app/Function/callCenterPersistence');
 
 const PORT = parseInt(process.env.PORT) || 9950;
 
@@ -34,6 +36,7 @@ const redis = new Redis({
 });
 
 const connections = new Map();
+const callCenterPersistence = startCallCenterPersistence();
 
 function safeLog(level, message, data = {}) {
     const meta = typeof data === 'object' ? data : { data };
@@ -473,6 +476,9 @@ function handleOtherConnections(ws, user, pathname, connectionId, request) {
             case '/handleWhatsapp':
                 handleWhatsappWrapper(ws, connectionId, request);
                 break;
+            case '/call-center/chat':
+                handleCallCenterWrapper(ws, user, connectionId);
+                break;
             default:
                 ws.send(JSON.stringify({
                     type: 'connected',
@@ -604,6 +610,17 @@ function handleWhatsappWrapper(ws, connectionId, request) {
     }
 }
 
+function handleCallCenterWrapper(ws, user, connectionId) {
+    try {
+        handleCallCenter(ws, user);
+        ws.on('close', () => {
+            handleDisconnection(connectionId);
+        });
+    } catch (error) {
+        handleError(error, 'handleCallCenterWrapper');
+    }
+}
+
 function handleDisconnection(connectionId) {
     try {
         const connection = connections.get(connectionId);
@@ -629,6 +646,10 @@ function gracefulShutdown() {
     safeLog('info', 'Shutting down gracefully...');
     
     try {
+        if (callCenterPersistence && typeof callCenterPersistence.stop === 'function') {
+            callCenterPersistence.stop();
+        }
+
         server.close(() => {
             safeLog('info', 'HTTP server closed');
         });
