@@ -2,7 +2,7 @@ const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { handleWhatsapp } = require('./app/Function/whatsappHandler');
 const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
-const { handleCallCenter } = require('./app/Function/callCenterHandler');
+const { handleCallCenter, handleCallCenterAdminBroadcast } = require('./app/Function/callCenterHandler');
 const editorHandler = require('./app/Function/editorHandler');
 const { removeConnection, normalizeRequestedPath } = require('./app/Helper/authMiddleware');
 const { logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
@@ -103,9 +103,12 @@ function setupWebSocketServer(webSocketServer) {
         // Attach guards (heartbeat, size/rate/backpressure)
         attachGuards(ws, pathname);
 
-        ws.on('close', () => {
-            removeConnection(user.userId);
-            logInfo(`Connection closed for user ${user.userId}`);
+        ws.on('close', async () => {
+            await removeConnection(user);
+            logInfo('Connection closed', {
+                userId: user.userId,
+                connectionKey: user.connectionKey || null,
+            });
         });
 
         const cleanRequestedPath = normalizeRequestedPath(pathname);
@@ -126,6 +129,9 @@ function setupWebSocketServer(webSocketServer) {
                     break;
                 case '/call-center/chat':
                     handleCallCenter(ws, user, request);
+                    break;
+                case '/call-center/admin/broadcast':
+                    handleCallCenterAdminBroadcast(ws, user, request);
                     break;
                 default:
                     // Check if it's an editor route

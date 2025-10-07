@@ -621,20 +621,20 @@ function handleCallCenterWrapper(ws, user, connectionId) {
     }
 }
 
-function handleDisconnection(connectionId) {
+async function handleDisconnection(connectionId) {
     try {
         const connection = connections.get(connectionId);
         if (connection) {
             safeLog('info', `Connection closed: ${connectionId}`);
-            
+
             if (connection.clientId) {
                 editorHandler.handleDisconnection(connection.clientId);
             }
-            
-            if (connection.user && connection.user.userId) {
-                removeConnection(connection.user.userId);
+
+            if (connection.user) {
+                await removeConnection(connection.user);
             }
-            
+
             connections.delete(connectionId);
         }
     } catch (error) {

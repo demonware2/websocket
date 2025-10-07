@@ -14,11 +14,14 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 const RESTRICTED_PATHS = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const RESTRICTED_PATHS_HTTP = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const DEFAULT_WS_ROUTE_PREFIXES = ['/siroum-websocket', '/websocket', '/node'];
-const MAX_CONNECTIONS_PER_USER = 30;
-const MAX_TOTAL_CONNECTIONS = 1000;
+const MAX_CONNECTIONS_PER_USER = parseInt(process.env.WS_MAX_CONNECTIONS_PER_USER || '30', 10);
+const MAX_CUSTOMER_CONNECTIONS_PER_USER = parseInt(process.env.WS_MAX_CUSTOMER_CONNECTIONS || String(Math.min(MAX_CONNECTIONS_PER_USER, 5)), 10);
+const MAX_MONITOR_CONNECTIONS_PER_ADMIN = parseInt(process.env.WS_MAX_MONITOR_CONNECTIONS || '3', 10);
+const MAX_TOTAL_CONNECTIONS = parseInt(process.env.WS_MAX_TOTAL_CONNECTIONS || '1000', 10);
 const BLOCK_DURATION = 3600;
 const MAX_FAILED_ATTEMPTS = 100;
 const FAILED_ATTEMPTS_EXPIRY = 300;
+const CONNECTION_COUNTER_TTL = parseInt(process.env.WS_CONNECTION_TTL || '900', 10);
 
 const BLOCKED_IPS = [];
 
@@ -293,9 +296,15 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
                     throw new AuthenticationError('Total connection limit reached', `Total connection limit reached, max: ${MAX_TOTAL_CONNECTIONS}`);
                 }
 
-                const userCanConnect = await checkUserConnectionLimit(authResult.userId);
-                if (!userCanConnect) {
-                    throw new AuthenticationError('Connection limit reached', `User ${authResult.userId} has reached the maximum number of connections`);
+                const scope = resolveConnectionScope(authResult);
+                if (scope) {
+                    const allowed = await registerConnection(scope.redisKey, scope.limit, scope.ttl);
+                    if (!allowed) {
+                        await decrementCounter('ws_total_connections');
+                        throw new AuthenticationError('Connection limit reached', `Connection limit reached for ${scope.redisKey} (max ${scope.limit})`);
+                    }
+                    authResult.connectionKey = scope.redisKey;
+                    authResult.connectionLimit = scope.limit;
                 }
 
                 await redis.del(`failed_auth:${normalizedIP}`);
@@ -370,6 +379,27 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
             return authResult;
         }
 
+        const isCallCenterMonitor = cleanRequestedPath === '/call-center/admin/broadcast'
+            && decoded.callCenter
+            && decoded.callCenter.role === 'admin_monitor';
+
+        if (isCallCenterMonitor) {
+            const authResult = {
+                ...decoded,
+                callCenterInternal: {
+                    role: 'admin_monitor',
+                },
+                roleId: null,
+                roles: Array.isArray(decoded.roles) ? decoded.roles : [],
+            };
+
+            logInfo('Call center admin monitor token accepted', {
+                userId: decoded.userId,
+            });
+
+            return authResult;
+        }
+
         const publicRoutes = Array.isArray(roleConfig.publicRoutes) ? roleConfig.publicRoutes : [];
         const isPublicRoute = publicRoutes.some((pattern) => matchesRoutePattern(pattern, cleanRequestedPath));
 
@@ -380,7 +410,7 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
         }
 
         if (!requiredRoles && !isPublicRoute) {
-            const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat', '/handleWhatsapp', '/call-center/chat'];
+            const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat', '/handleWhatsapp', '/call-center/chat', '/call-center/admin/broadcast'];
             if (!allowedPaths.includes(cleanRequestedPath)) {
                 throw new AuthenticationError('Route not configured', `Route not configured: ${cleanRequestedPath}`);
             }
@@ -484,28 +514,99 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
     }
 }
 
+function resolveConnectionScope(authResult) {
+    if (!authResult || typeof authResult !== 'object') {
+        return null;
+    }
+
+    const ttl = Math.max(CONNECTION_COUNTER_TTL, 60);
+
+    if (authResult.callCenterInternal && authResult.callCenterInternal.role === 'admin_monitor') {
+        const adminId = authResult.actorId || authResult.userId || 'unknown';
+        return {
+            redisKey: `ws_connections:monitor:${adminId}`,
+            limit: Math.max(1, MAX_MONITOR_CONNECTIONS_PER_ADMIN || 1),
+            ttl,
+        };
+    }
+
+    if (authResult.callCenterInternal && authResult.callCenterInternal.role === 'customer') {
+        const customerId = authResult.userId || `session:${authResult.callCenterInternal.sessionId || 'unknown'}`;
+        return {
+            redisKey: `ws_connections:customer:${customerId}`,
+            limit: Math.max(1, MAX_CUSTOMER_CONNECTIONS_PER_USER || 1),
+            ttl,
+        };
+    }
+
+    const genericId = authResult.userId || 'anonymous';
+    return {
+        redisKey: `ws_connections:user:${genericId}`,
+        limit: Math.max(1, MAX_CONNECTIONS_PER_USER || 1),
+        ttl,
+    };
+}
+
+async function registerConnection(redisKey, limit, ttlSeconds) {
+    if (!redisKey || limit <= 0) {
+        return true;
+    }
+
+    const current = Number(await redis.incr(redisKey));
+    if (current > limit) {
+        await redis.decr(redisKey);
+        return false;
+    }
+
+    if (ttlSeconds > 0) {
+        await redis.expire(redisKey, ttlSeconds);
+    }
+
+    return true;
+}
+
+async function decrementCounter(redisKey) {
+    if (!redisKey) {
+        return;
+    }
+
+    try {
+        const value = Number(await redis.decr(redisKey));
+        if (value <= 0) {
+            await redis.del(redisKey);
+        } else {
+            await redis.expire(redisKey, Math.max(CONNECTION_COUNTER_TTL, 60));
+        }
+    } catch (error) {
+        logWarning('Failed to decrement connection counter', { key: redisKey, error: error.message });
+    }
+}
+
 async function checkTotalConnectionLimit() {
-    const totalConnections = await redis.incr('ws_total_connections');
+    const totalKey = 'ws_total_connections';
+    const totalConnections = Number(await redis.incr(totalKey));
     if (totalConnections > MAX_TOTAL_CONNECTIONS) {
-        await redis.decr('ws_total_connections');
+        await redis.decr(totalKey);
         return false;
     }
+    await redis.expire(totalKey, Math.max(CONNECTION_COUNTER_TTL, 60));
     return true;
 }
 
-async function checkUserConnectionLimit(userId) {
-    const connectionCount = await redis.incr(`ws_user_connections:${userId}`);
-    if (connectionCount > MAX_CONNECTIONS_PER_USER) {
-        await redis.decr(`ws_user_connections:${userId}`);
-        return false;
+async function removeConnection(user) {
+    if (!user) {
+        return;
     }
-    await redis.expire(`ws_user_connections:${userId}`, 3600);
-    return true;
-}
 
-async function removeConnection(userId) {
-    await redis.decr(`ws_user_connections:${userId}`);
-    await redis.decr('ws_total_connections');
+    let connectionKey = null;
+    if (typeof user === 'string') {
+        connectionKey = `ws_connections:user:${user}`;
+    } else if (typeof user === 'object') {
+        connectionKey = user.connectionKey || (user.userId ? `ws_connections:user:${user.userId}` : null);
+    }
+
+    await decrementCounter(connectionKey);
+    await decrementCounter('ws_total_connections');
 }
 
 function getUserRolesFromCache(userId) {

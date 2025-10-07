@@ -37,6 +37,7 @@ const NODE_ID = `${os.hostname()}-${process.pid}`;
 
 const sessionConnections = new Map();
 const connectionMeta = new Map();
+const monitorConnections = new Set();
 
 const INACTIVITY_TTL_SECONDS = SESSION_INACTIVITY_TTL > 0 ? Math.max(SESSION_INACTIVITY_TTL, 30) : 0;
 
@@ -170,6 +171,36 @@ function broadcastToSession(sessionId, payload, excludeWs = null) {
     });
 }
 
+function broadcastToMonitors(payload) {
+    if (monitorConnections.size === 0) {
+        return;
+    }
+
+    const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    monitorConnections.forEach((client) => {
+        if (!client || client.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        try {
+            client.send(data);
+        } catch (error) {
+            logWarning('Failed sending to call center monitor', { error: error.message });
+        }
+    });
+}
+
+function emitMonitorEvent(event, details = {}) {
+    broadcastToMonitors({
+        type: 'callcenter:dashboard',
+        payload: {
+            event,
+            emittedAt: new Date().toISOString(),
+            ...details,
+        },
+    });
+}
+
 async function queueForPersistence(message) {
     try {
         await persistenceRedis.rpush('callcenter:persistence', JSON.stringify(message));
@@ -263,6 +294,12 @@ function cleanupConnection(ws) {
         return;
     }
 
+    if (meta.monitor) {
+        monitorConnections.delete(ws);
+        connectionMeta.delete(ws);
+        return;
+    }
+
     const entry = sessionConnections.get(meta.sessionId);
     if (entry) {
         entry.agents.delete(ws);
@@ -301,6 +338,27 @@ function subscribeRealtimeChannel() {
         }
 
         const entry = sessionConnections.get(sessionId);
+
+        if (payload.kind === 'session_created') {
+            emitMonitorEvent('session_created', {
+                sessionId,
+                status: payload.status || 'pending',
+            });
+        } else if (payload.kind === 'session_claimed') {
+            emitMonitorEvent('session_claimed', {
+                sessionId,
+                actor: 'agent',
+                userId: payload.actorId || null,
+                assignedAdminId: payload.assignedAdminId || null,
+            });
+        } else if (payload.kind === 'session_closed') {
+            emitMonitorEvent('session_closed', {
+                sessionId,
+                reason: payload.reason || null,
+                source: payload.sourceNode || null,
+            });
+        }
+
         if (!entry) {
             return;
         }
@@ -375,8 +433,56 @@ function handleCallCenter(ws, user) {
             role,
         },
     }));
+
+    if (role === 'customer') {
+        emitMonitorEvent('session_connected', {
+            sessionId,
+            sessionUuid,
+            actor: 'customer',
+            userId,
+        });
+    } else if (role === 'agent') {
+        emitMonitorEvent('session_claimed', {
+            sessionId,
+            actor: 'agent',
+            userId,
+        });
+    }
+}
+
+function handleCallCenterAdminBroadcast(ws, user) {
+    const callCenterData = user.callCenter;
+    if (!callCenterData || callCenterData.role !== 'admin_monitor') {
+        logWarning('Unauthorized monitor connection attempt', { userId: user.userId });
+        try { ws.close(4403, 'Unauthorized'); } catch (_) {}
+        return;
+    }
+
+    monitorConnections.add(ws);
+    connectionMeta.set(ws, { monitor: true, userId: user.userId });
+
+    ws.on('close', () => cleanupConnection(ws));
+    ws.on('error', (error) => logWarning('Call center monitor websocket error', { error: error.message }));
+
+    logInfo('Call center monitor connection established', {
+        userId: user.userId,
+    });
+
+    try {
+        ws.send(JSON.stringify({
+            type: 'callcenter:dashboard',
+            payload: {
+                event: 'monitor_connected',
+                emittedAt: new Date().toISOString(),
+                userId: user.userId,
+            },
+        }));
+    } catch (error) {
+        logWarning('Failed sending monitor acknowledgement', { error: error.message });
+    }
 }
 
 module.exports = {
     handleCallCenter,
+    handleCallCenterAdminBroadcast,
 };
