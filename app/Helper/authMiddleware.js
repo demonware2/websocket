@@ -13,6 +13,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 const RESTRICTED_PATHS = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const RESTRICTED_PATHS_HTTP = ['/handleWhatsapp', '/anotherRestrictedPath'];
+const DEFAULT_WS_ROUTE_PREFIXES = ['/siroum-websocket', '/websocket', '/node'];
 const MAX_CONNECTIONS_PER_USER = 30;
 const MAX_TOTAL_CONNECTIONS = 1000;
 const BLOCK_DURATION = 3600;
@@ -42,6 +43,41 @@ const redis = new Redis({
 });
 
 const userRoleCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+
+function sanitizeRoutePrefix(prefix) {
+    if (typeof prefix !== 'string') {
+        return null;
+    }
+
+    let trimmed = prefix.trim();
+    if (trimmed === '') {
+        return null;
+    }
+
+    if (!trimmed.startsWith('/')) {
+        trimmed = `/${trimmed}`;
+    }
+
+    if (trimmed.endsWith('/') && trimmed.length > 1) {
+        trimmed = trimmed.slice(0, -1);
+    }
+
+    if (trimmed === '/') {
+        return null;
+    }
+
+    return trimmed;
+}
+
+const wsRoutePrefixes = (() => {
+    const rawPrefixes = process.env.WS_ROUTE_PREFIXES;
+    const basePrefixes = rawPrefixes ? rawPrefixes.split(',') : DEFAULT_WS_ROUTE_PREFIXES;
+    const normalized = basePrefixes
+        .map(sanitizeRoutePrefix)
+        .filter((prefix, index, array) => prefix && array.indexOf(prefix) === index);
+
+    return normalized;
+})();
 
 const rateLimiter = new RateLimit.RateLimiterRedis({
     storeClient: redis,
@@ -91,6 +127,46 @@ function normalizeIP(ip) {
     }
 
     return ip;
+}
+
+function normalizeRequestedPath(pathname) {
+    if (typeof pathname !== 'string' || pathname.length === 0) {
+        return '/';
+    }
+
+    let normalized = pathname.startsWith('/') ? pathname : `/${pathname}`;
+
+    let updated = true;
+    while (updated) {
+        updated = false;
+        for (const prefix of wsRoutePrefixes) {
+            if (!prefix) {
+                continue;
+            }
+
+            if (normalized === prefix) {
+                normalized = '/';
+                updated = true;
+                continue;
+            }
+
+            if (normalized.startsWith(`${prefix}/`)) {
+                normalized = normalized.slice(prefix.length);
+                if (normalized === '') {
+                    normalized = '/';
+                } else if (!normalized.startsWith('/')) {
+                    normalized = `/${normalized}`;
+                }
+                updated = true;
+            }
+        }
+    }
+
+    if (normalized.length > 1 && normalized.endsWith('/')) {
+        normalized = normalized.slice(0, -1);
+    }
+
+    return normalized;
 }
 
 function constantTimeCompare(a, b) {
@@ -163,19 +239,7 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
         // const cleanRequestedPath = pathname.replace(/^\/socket/, '');
 
-        let cleanRequestedPath = pathname;
-
-        if (cleanRequestedPath.startsWith('/websocket')) {
-            cleanRequestedPath = cleanRequestedPath.replace(/^\/websocket/, '');
-        }
-
-        if (cleanRequestedPath.startsWith('/node')) {
-            cleanRequestedPath = cleanRequestedPath.replace(/^\/node/, '');
-        }
-
-        if (cleanRequestedPath === '') {
-            cleanRequestedPath = '/';
-        }
+        const cleanRequestedPath = normalizeRequestedPath(pathname);
 
         if (typeRequest === 'ws') {
             const whatsappSecret = searchParams.get('whatsapp_secret');
@@ -538,5 +602,6 @@ module.exports = {
     isTokenRevoked,
     removeConnection,
     blockIP,
-    isIPBlocked
+    isIPBlocked,
+    normalizeRequestedPath
 };

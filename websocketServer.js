@@ -4,7 +4,7 @@ const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
 const { handleCallCenter } = require('./app/Function/callCenterHandler');
 const editorHandler = require('./app/Function/editorHandler');
-const { removeConnection } = require('./app/Helper/authMiddleware');
+const { removeConnection, normalizeRequestedPath } = require('./app/Helper/authMiddleware');
 const { logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
 
 let wss;
@@ -108,19 +108,7 @@ function setupWebSocketServer(webSocketServer) {
             logInfo(`Connection closed for user ${user.userId}`);
         });
 
-        let cleanRequestedPath = pathname;
-
-        if (cleanRequestedPath.startsWith('/websocket')) {
-            cleanRequestedPath = cleanRequestedPath.replace(/^\/websocket/, '');
-        }
-
-        if (cleanRequestedPath.startsWith('/node')) {
-            cleanRequestedPath = cleanRequestedPath.replace(/^\/node/, '');
-        }
-
-        if (cleanRequestedPath === '') {
-            cleanRequestedPath = '/';
-        }
+        const cleanRequestedPath = normalizeRequestedPath(pathname);
 
         try {
             switch (cleanRequestedPath) {
