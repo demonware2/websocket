@@ -14,6 +14,169 @@ const DEFAULT_MAX_MSG_BYTES = parseInt(process.env.WS_MAX_MSG_BYTES || String(25
 const EDITOR_MAX_MSG_BYTES = parseInt(process.env.WS_EDITOR_MAX_MSG_BYTES || String(5 * 1024 * 1024), 10); // 5MB for editor
 const BUFFERED_AMOUNT_LIMIT = parseInt(process.env.WS_BUFFERED_LIMIT || String(1024 * 1024), 10); // 1MB default
 
+const kajianPresenceRooms = new Map();
+
+function presenceRandomId() {
+    return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function getKajianPresenceRoom(rppId) {
+    if (!kajianPresenceRooms.has(rppId)) {
+        kajianPresenceRooms.set(rppId, {
+            clients: new Set(),
+            users: new Map(),
+        });
+    }
+    return kajianPresenceRooms.get(rppId);
+}
+
+function presenceSafeSend(ws, payload) {
+    try {
+        if (!ws || ws.readyState !== ws.OPEN) {
+            return false;
+        }
+        const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+        ws.send(data);
+        return true;
+    } catch (error) {
+        logWarning('Presence send failed', { message: error.message });
+        return false;
+    }
+}
+
+function serializeKajianUsers(room, excludeUserId = null) {
+    const users = [];
+    room.users.forEach((info, userId) => {
+        if (excludeUserId && userId === excludeUserId) {
+            return;
+        }
+        users.push({ userId, userName: info.userName });
+    });
+    return users;
+}
+
+function broadcastKajianPresence(rppId, payload, excludeWs = null) {
+    const room = kajianPresenceRooms.get(rppId);
+    if (!room) {
+        return;
+    }
+    room.clients.forEach((clientWs) => {
+        if (clientWs !== excludeWs) {
+            presenceSafeSend(clientWs, payload);
+        }
+    });
+}
+
+function detachKajianPresence(ws) {
+    const meta = ws._kajianPresence;
+    if (!meta || meta.removed) {
+        return;
+    }
+
+    meta.removed = true;
+    const { rppId, userId } = meta;
+    const room = kajianPresenceRooms.get(rppId);
+    if (!room) {
+        return;
+    }
+
+    room.clients.delete(ws);
+
+    const info = room.users.get(userId);
+    if (info) {
+        info.count -= 1;
+        if (info.count <= 0) {
+            room.users.delete(userId);
+            broadcastKajianPresence(rppId, {
+                type: 'presence:left',
+                user: { userId, userName: info.userName },
+            }, ws);
+        } else {
+            room.users.set(userId, info);
+        }
+    }
+
+    if (room.clients.size === 0) {
+        kajianPresenceRooms.delete(rppId);
+    }
+
+    logInfo('Kajian presence leave', { rppId, userId });
+}
+
+function handleKajianPresence(ws, user, rppId) {
+    if (!rppId) {
+        logWarning('Kajian presence refused: missing rpp_id');
+        try { ws.close(1008, 'Missing rpp_id'); } catch (_) {}
+        return;
+    }
+
+    const userId = user.uuid || user.userId || user.id;
+    if (!userId) {
+        logWarning('Kajian presence refused: missing user identifier');
+        try { ws.close(1008, 'Missing user identifier'); } catch (_) {}
+        return;
+    }
+
+    const userName = user.name || user.username || 'Pengguna';
+    const room = getKajianPresenceRoom(rppId);
+    const connectionId = presenceRandomId();
+
+    ws._kajianPresence = {
+        rppId,
+        userId,
+        userName,
+        connectionId,
+        removed: false,
+    };
+
+    room.clients.add(ws);
+
+    const info = room.users.get(userId) || { userName, count: 0, lastSeen: 0 };
+    info.count += 1;
+    info.userName = userName;
+    info.lastSeen = Date.now();
+    room.users.set(userId, info);
+
+    logDebug('Kajian presence join', { rppId, userId, connectionId });
+
+    presenceSafeSend(ws, {
+        type: 'presence:init',
+        users: serializeKajianUsers(room, userId),
+    });
+
+    broadcastKajianPresence(rppId, {
+        type: 'presence:join',
+        user: { userId, userName },
+    }, ws);
+
+    ws.on('message', (raw) => {
+        try {
+            const payload = typeof raw === 'string' ? JSON.parse(raw) : JSON.parse(raw.toString());
+            if (payload && payload.type === 'presence:ping') {
+                const state = ws._kajianPresence;
+                if (!state) {
+                    return;
+                }
+                const currentRoom = kajianPresenceRooms.get(state.rppId);
+                if (!currentRoom) {
+                    return;
+                }
+                const currentInfo = currentRoom.users.get(state.userId);
+                if (currentInfo) {
+                    currentInfo.lastSeen = Date.now();
+                    currentRoom.users.set(state.userId, currentInfo);
+                }
+            }
+        } catch (_) {
+            // ignore invalid payloads for presence channel
+        }
+    });
+
+    const cleanup = () => detachKajianPresence(ws);
+    ws.once('close', cleanup);
+    ws.once('error', cleanup);
+}
+
 function createRateLimiter(capacity, intervalMs) {
     return {
         capacity,
@@ -134,8 +297,27 @@ function setupWebSocketServer(webSocketServer) {
                     handleCallCenterAdminBroadcast(ws, user, request);
                     break;
                 default:
-                    // Check if it's an editor route
-                    if (cleanRequestedPath.startsWith('/editor/')) {
+                    if (cleanRequestedPath === '/kajian-presence' || cleanRequestedPath.startsWith('/kajian-presence/')) {
+                        let rppId = null;
+                        if (cleanRequestedPath.startsWith('/kajian-presence/')) {
+                            rppId = cleanRequestedPath.split('/')[2] || null;
+                        }
+                        if (!rppId) {
+                            try {
+                                const searchParams = new URL(request.url, 'http://localhost').searchParams;
+                                rppId = searchParams.get('rpp_id');
+                            } catch (_) {
+                                rppId = null;
+                            }
+                        }
+
+                        if (rppId) {
+                            handleKajianPresence(ws, user, rppId);
+                        } else {
+                            logWarning('Invalid kajian presence route - missing rpp_id');
+                            ws.close();
+                        }
+                    } else if (cleanRequestedPath.startsWith('/editor/')) {
                         const rppId = cleanRequestedPath.split('/')[2];
                         if (rppId) {
                             handleEditor(ws, user, request, rppId);
