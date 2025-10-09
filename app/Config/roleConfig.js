@@ -11,6 +11,8 @@ module.exports = {
         '/call-center/chat': [1, 2, 3, 4],
         '/kajian-presence': [1, 2, 3, 4],
         '/kajian-presence/{rppId}': [1, 2, 3, 4],
+        '/penetapan-presence': [1, 2, 3, 4],
+        '/penetapan-presence/{rppId}': [1, 2, 3, 4],
         '/editor': [1, 2, 3, 4], // Editor route for all authenticated users
     },
     publicRoutes: [

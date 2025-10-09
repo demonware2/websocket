@@ -1,7 +1,7 @@
 module.exports = {
   apps: [{
     name: "websocket",
-    script: 'new-server.js',
+    script: 'server.js',
     watch: false,
     max_restarts: 3,
     restart_delay: 5000,
