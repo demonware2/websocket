@@ -9,10 +9,10 @@ module.exports = {
         '/gatherPM2Data': [1, 2, 3, 4],
         '/handleChat': [1, 2, 3, 4], // Added new route for chat
         '/call-center/chat': [1, 2, 3, 4],
-        '/kajian-presence': [1, 2, 3, 4],
-        '/kajian-presence/{rppId}': [1, 2, 3, 4],
-        '/penetapan-presence': [1, 2, 3, 4],
-        '/penetapan-presence/{rppId}': [1, 2, 3, 4],
+        '/kajian-presence': [7],
+        '/kajian-presence/{rppId}': [7],
+        '/penetapan-presence': [7],
+        '/penetapan-presence/{rppId}': [7],
         '/editor': [1, 2, 3, 4], // Editor route for all authenticated users
     },
     publicRoutes: [
