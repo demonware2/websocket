@@ -14,6 +14,56 @@ const redisConfig = {
 const realtimePublisher = new Redis(redisConfig);
 const realtimeSubscriber = new Redis(redisConfig);
 const persistenceRedis = new Redis({ ...redisConfig, db: 2 });
+const historyRedis = new Redis({ ...redisConfig, db: 4 });
+
+const HISTORY_CACHE_TTL = 10800; // 3 jam
+
+async function appendHistoryCache(sessionId, message) {
+    try {
+        const key = `chat:history:${sessionId}`;
+        const bufferKey = `chat:buffer:${sessionId}`;
+        await historyRedis.rpush(key, JSON.stringify(message));
+        await historyRedis.expire(key, HISTORY_CACHE_TTL);
+        await historyRedis.rpush(bufferKey, JSON.stringify(message));
+        await historyRedis.expire(bufferKey, 300);
+    } catch (e) {
+        logError('Failed to append history cache', { sessionId, error: e.message });
+    }
+}
+
+async function markHistoryAsReadCache(sessionId, readerType, messageId) {
+    try {
+        const key = `chat:history:${sessionId}`;
+        const bufferKey = `chat:buffer:${sessionId}`;
+        
+        const cacheKeys = [key, bufferKey];
+        for (const k of cacheKeys) {
+            const items = await historyRedis.lrange(k, 0, -1);
+            if (!items.length) continue;
+
+            let found = false;
+            const updated = items.map(raw => {
+                const m = JSON.parse(raw);
+                const senderType = m.senderType || m.sender_type;
+                const isMatch = (m.id == messageId || m.clientMessageId == messageId);
+                const isPrev = (!isNaN(m.id) && !isNaN(messageId) && Number(m.id) <= Number(messageId));
+
+                if (senderType !== readerType && (isMatch || isPrev || messageId === 'all')) {
+                    m.status = 'read'; found = true;
+                }
+                return JSON.stringify(m);
+            });
+
+            if (found) {
+                await historyRedis.del(k);
+                await historyRedis.rpush(k, ...updated);
+                await historyRedis.expire(k, k === bufferKey ? 300 : HISTORY_CACHE_TTL);
+            }
+        }
+    } catch (e) {
+        logError('Failed to update history read cache', { sessionId, error: e.message });
+    }
+}
 
 const EXPIRY_DB = Number(process.env.CALL_CENTER_EXPIRY_DB || 3);
 const SESSION_INACTIVITY_TTL = Number(process.env.CALL_CENTER_INACTIVE_TIMEOUT_SECONDS || 900);
@@ -22,771 +72,204 @@ const EXPIRY_KEY_PREFIX = process.env.CALL_CENTER_EXPIRY_KEY_PREFIX || 'callcent
 const expiryRedis = SESSION_INACTIVITY_TTL > 0 ? new Redis({ ...redisConfig, db: EXPIRY_DB }) : null;
 const expirySubscriber = SESSION_INACTIVITY_TTL > 0 ? new Redis({ ...redisConfig, db: EXPIRY_DB }) : null;
 
-const PRIMARY_ATTACHMENT_SECRET = process.env.LIVECHAT_ATTACHMENT_SECRET
-    || process.env.ENCRYPTION_KEY
-    || 'livechat-secret';
-
-const ATTACHMENT_SECRETS = [
-    PRIMARY_ATTACHMENT_SECRET,
-    process.env.ENCRYPTION_KEY,
-].filter((value, index, array) => typeof value === 'string' && value.length > 0 && array.indexOf(value) === index);
+const PRIMARY_ATTACHMENT_SECRET = process.env.LIVECHAT_ATTACHMENT_SECRET || process.env.ENCRYPTION_KEY || 'livechat-secret';
+const ATTACHMENT_SECRETS = [PRIMARY_ATTACHMENT_SECRET, process.env.ENCRYPTION_KEY].filter((v, i, a) => v && a.indexOf(v) === i);
 
 function buildAttachmentTokenWithSecret(secret, sessionId, filePath) {
-    const effectiveSecret = secret || 'livechat-secret';
-
-    return crypto
-        .createHmac('sha256', effectiveSecret)
-        .update(`${sessionId}|${filePath}`)
-        .digest('hex');
+    return crypto.createHmac('sha256', secret || 'livechat-secret').update(`${sessionId}|${filePath}`).digest('hex');
 }
 
 function verifyAttachmentToken(sessionId, filePath, token) {
-    if (!token || !filePath) {
-        return false;
-    }
-
-    return ATTACHMENT_SECRETS.some((secret) => {
-        try {
-            const expected = buildAttachmentTokenWithSecret(secret, sessionId, filePath);
-            return expected === token;
-        } catch (error) {
-            logWarning('Failed to compute attachment token', {
-                error: error.message,
-                sessionId,
-                filePath,
-            });
-            return false;
-        }
+    if (!token || !filePath) return false;
+    return ATTACHMENT_SECRETS.some(s => {
+        try { return buildAttachmentTokenWithSecret(s, sessionId, filePath) === token; } catch (e) { return false; }
     });
 }
 
-if (expiryRedis) {
-    expiryRedis.on('error', (error) => {
-        logWarning('Call center expiry redis error', { error: error.message });
-    });
-}
-
-if (expirySubscriber) {
-    expirySubscriber.on('error', (error) => {
-        logWarning('Call center expiry subscriber error', { error: error.message });
-    });
-}
+if (expiryRedis) expiryRedis.on('error', e => logWarning('Expiry redis error', { error: e.message }));
+if (expirySubscriber) expirySubscriber.on('error', e => logWarning('Expiry sub error', { error: e.message }));
 
 const NODE_ID = `${os.hostname()}-${process.pid}`;
-
 const sessionConnections = new Map();
 const connectionMeta = new Map();
 const monitorConnections = new Set();
-
 const INACTIVITY_TTL_SECONDS = SESSION_INACTIVITY_TTL > 0 ? Math.max(SESSION_INACTIVITY_TTL, 30) : 0;
 
 function refreshSessionExpiry(sessionId, isPersistent = false) {
-    if (!expiryRedis || !sessionId || INACTIVITY_TTL_SECONDS <= 0 || isPersistent) {
-        return;
-    }
-
-    expiryRedis
-        .set(`${EXPIRY_KEY_PREFIX}${sessionId}`, Date.now().toString(), 'EX', INACTIVITY_TTL_SECONDS)
-        .catch((error) => {
-            logWarning('Failed to refresh session inactivity TTL', { error: error.message, sessionId });
-        });
+    if (!expiryRedis || !sessionId || INACTIVITY_TTL_SECONDS <= 0 || isPersistent) return;
+    expiryRedis.set(`${EXPIRY_KEY_PREFIX}${sessionId}`, Date.now().toString(), 'EX', INACTIVITY_TTL_SECONDS).catch(e => {});
 }
 
 function clearSessionExpiry(sessionId) {
-    if (!expiryRedis || !sessionId) {
-        return;
-    }
-
-    expiryRedis
-        .del(`${EXPIRY_KEY_PREFIX}${sessionId}`)
-        .catch((error) => {
-            logWarning('Failed to clear session inactivity TTL', { error: error.message, sessionId });
-        });
+    if (!expiryRedis || !sessionId) return;
+    expiryRedis.del(`${EXPIRY_KEY_PREFIX}${sessionId}`).catch(e => {});
 }
 
 async function ensureExpiryNotificationSupport() {
-    if (!expiryRedis || INACTIVITY_TTL_SECONDS <= 0) {
-        return;
-    }
-
+    if (!expiryRedis || INACTIVITY_TTL_SECONDS <= 0) return;
     try {
-        const configResult = await expiryRedis.config('GET', 'notify-keyspace-events');
-        const currentValue = Array.isArray(configResult) ? configResult[1] || '' : '';
-        let desiredValue = typeof currentValue === 'string' ? currentValue : '';
-
-        if (!desiredValue.includes('E')) {
-            desiredValue += 'E';
-        }
-        if (!desiredValue.includes('x')) {
-            desiredValue += 'x';
-        }
-
-        if (desiredValue !== currentValue) {
-            await expiryRedis.config('SET', 'notify-keyspace-events', desiredValue);
-        }
-    } catch (error) {
-        logWarning('Unable to configure Redis keyspace notifications', { error: error.message });
-        throw error;
-    }
+        const res = await expiryRedis.config('GET', 'notify-keyspace-events');
+        let val = (Array.isArray(res) ? res[1] : '') || '';
+        if (!val.includes('E')) val += 'E';
+        if (!val.includes('x')) val += 'x';
+        await expiryRedis.config('SET', 'notify-keyspace-events', val);
+    } catch (e) {}
 }
 
 function subscribeExpiryEvents() {
-    if (!expirySubscriber || INACTIVITY_TTL_SECONDS <= 0) {
-        return;
-    }
-
+    if (!expirySubscriber || INACTIVITY_TTL_SECONDS <= 0) return;
     const channel = `__keyevent@${EXPIRY_DB}__:expired`;
-
-    expirySubscriber.subscribe(channel, (error) => {
-        if (error) {
-            logWarning('Failed subscribing to inactivity expiry channel', { error: error.message });
-        }
-    });
-
-    expirySubscriber.on('message', (_channel, key) => {
-        if (typeof key !== 'string' || !key.startsWith(EXPIRY_KEY_PREFIX)) {
-            return;
-        }
-
-        const sessionId = Number(key.slice(EXPIRY_KEY_PREFIX.length));
-        if (!Number.isFinite(sessionId) || sessionId <= 0) {
-            return;
-        }
-
-        queueForPersistence({
-            action: 'expire',
-            payload: {
-                sessionId,
-                reason: 'inactivity',
-                emittedAt: new Date().toISOString(),
-            },
-        }).catch((error) => {
-            logError('Failed to enqueue inactivity expiration', { error: error.message, sessionId });
-        });
+    expirySubscriber.subscribe(channel);
+    expirySubscriber.on('message', (ch, key) => {
+        if (!key.startsWith(EXPIRY_KEY_PREFIX)) return;
+        const sid = Number(key.slice(EXPIRY_KEY_PREFIX.length));
+        if (sid > 0) queueForPersistence({ action: 'expire', payload: { sessionId: sid, reason: 'inactivity' } });
     });
 }
 
-function initExpiryMonitor() {
-    if (!expiryRedis || !expirySubscriber || INACTIVITY_TTL_SECONDS <= 0) {
-        return;
-    }
+initExpiryMonitor();
+function initExpiryMonitor() { if (expiryRedis && expirySubscriber) ensureExpiryNotificationSupport().finally(() => subscribeExpiryEvents()); }
 
-    ensureExpiryNotificationSupport()
-        .catch(() => {})
-        .finally(() => {
-            subscribeExpiryEvents();
-        });
-}
+function ensureSessionEntry(sid) { if (!sessionConnections.has(sid)) sessionConnections.set(sid, { agents: new Set(), customers: new Set() }); return sessionConnections.get(sid); }
 
-function ensureSessionEntry(sessionId) {
-    if (!sessionConnections.has(sessionId)) {
-        sessionConnections.set(sessionId, {
-            agents: new Set(),
-            customers: new Set(),
-        });
-    }
-    return sessionConnections.get(sessionId);
-}
-
-function broadcastToSession(sessionId, payload, excludeWs = null) {
-    const entry = sessionConnections.get(sessionId);
-    if (!entry) {
-        return;
-    }
-
+function broadcastToSession(sid, payload, skip = null) {
+    const entry = sessionConnections.get(sid);
+    if (!entry) return;
     const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
-    [...entry.agents, ...entry.customers].forEach((client) => {
-        if (!client || client === excludeWs) {
-            return;
-        }
-        if (client.readyState !== WebSocket.OPEN) {
-            return;
-        }
-        try {
-            client.send(data);
-        } catch (error) {
-            logWarning('Failed sending to call center client', { error: error.message });
-        }
-    });
+    [...entry.agents, ...entry.customers].forEach(c => { if (c && c !== skip && c.readyState === WebSocket.OPEN) c.send(data); });
 }
 
 function broadcastToMonitors(payload) {
-    if (monitorConnections.size === 0) {
-        return;
-    }
-
     const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
-    monitorConnections.forEach((client) => {
-        if (!client || client.readyState !== WebSocket.OPEN) {
-            return;
-        }
-
-        try {
-            client.send(data);
-        } catch (error) {
-            logWarning('Failed sending to call center monitor', { error: error.message });
-        }
-    });
+    monitorConnections.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); });
 }
 
-function emitMonitorEvent(event, details = {}) {
-    broadcastToMonitors({
-        type: 'callcenter:dashboard',
-        payload: {
-            event,
-            emittedAt: new Date().toISOString(),
-            ...details,
-        },
-    });
-}
+function emitMonitorEvent(event, details = {}) { broadcastToMonitors({ type: 'callcenter:dashboard', payload: { event, emittedAt: new Date().toISOString(), ...details } }); }
 
-async function queueForPersistence(message) {
-    try {
-        await persistenceRedis.rpush('callcenter:persistence', JSON.stringify(message));
-    } catch (error) {
-        logError('Failed to push message to persistence queue', { error: error.message });
-    }
-}
+async function queueForPersistence(msg) { try { await persistenceRedis.rpush('callcenter:persistence', JSON.stringify(msg)); } catch (e) {} }
 
-function publishRealtime(sessionId, payload) {
-    try {
-        realtimePublisher.publish(
-            `callcenter:session:${sessionId}`,
-            JSON.stringify({
-                ...payload,
-                sessionId,
-                sourceNode: NODE_ID,
-            }),
-        );
-    } catch (error) {
-        logError('Failed publishing realtime payload', { error: error.message });
-    }
-}
+function publishRealtime(sid, payload) { try { realtimePublisher.publish(`callcenter:session:${sid}`, JSON.stringify({ ...payload, sessionId: sid, sourceNode: NODE_ID })); } catch (e) {} }
 
 function handleInboundMessage(ws, meta, raw) {
-    let data;
-    try {
-        data = typeof raw === 'string' ? JSON.parse(raw) : JSON.parse(raw.toString());
-    } catch (error) {
-        logWarning('Invalid call center payload', { error: error.message });
-        return;
-    }
-
+    let data; try { data = JSON.parse(raw); } catch (e) { return; }
     const { sessionId, role, sessionUuid, actorId, senderName, isPersistent } = meta;
 
     switch (data.type) {
-        case 'ping':
-            ws.send(JSON.stringify({ type: 'pong', at: Date.now() }));
-            refreshSessionExpiry(sessionId, isPersistent);
-            break;
+        case 'ping': ws.send(JSON.stringify({ type: 'pong', at: Date.now() })); refreshSessionExpiry(sessionId, isPersistent); break;
         case 'typing':
-            publishRealtime(sessionId, {
-                kind: 'typing',
-                actor: role,
-                sessionUuid,
-            });
+            publishRealtime(sessionId, { kind: 'typing', actor: role, sessionUuid });
+            broadcastToSession(sessionId, { type: 'typing', senderType: role === 'agent' ? 'admin' : 'customer' }, ws);
+            break;
+        case 'read_receipt':
+            broadcastToSession(sessionId, { type: 'read_receipt', messageId: data.messageId, senderType: role === 'agent' ? 'admin' : 'customer' }, ws);
+            markHistoryAsReadCache(sessionId, role === 'agent' ? 'admin' : 'customer', data.messageId);
+            queueForPersistence({ action: 'read', payload: { sessionId, messageId: data.messageId, readerType: role === 'agent' ? 'admin' : 'customer', readAt: new Date().toISOString() } });
             break;
         case 'message': {
-            const rawContent = typeof data.content === 'string' ? data.content : '';
-            const attachmentsInput = Array.isArray(data.attachments) ? data.attachments : [];
-
-            const attachments = attachmentsInput.reduce((list, attachment) => {
-                if (!attachment || typeof attachment !== 'object') {
-                    return list;
-                }
-
-                const attachmentId = Number(attachment.attachmentId || attachment.id || 0);
-                const fileName = typeof attachment.fileName === 'string' ? attachment.fileName : null;
-                const downloadToken = typeof attachment.downloadToken === 'string' ? attachment.downloadToken : (typeof attachment.token === 'string' ? attachment.token : null);
-                const filePath = typeof attachment.filePath === 'string' ? attachment.filePath : null;
-
-                if (!attachmentId || !fileName || !downloadToken || !filePath) {
-                    logWarning('Attachment payload missing required fields for message', { attachment });
-                    return list;
-                }
-
-                const isTokenValid = verifyAttachmentToken(sessionId, filePath, downloadToken);
-                const normalizedToken = buildAttachmentTokenWithSecret(PRIMARY_ATTACHMENT_SECRET, sessionId, filePath);
-
-                if (!isTokenValid) {
-                    logWarning('Attachment download token mismatch (message)', {
-                        sessionId,
-                        attachmentId,
-                    });
-                }
-
-                list.push({
-                    id: attachmentId,
-                    attachmentId,
-                    fileName,
-                    fileSize: Number(attachment.fileSize || attachment.file_size || 0),
-                    mimeType: attachment.mimeType || attachment.mime_type || 'application/octet-stream',
-                    downloadToken: normalizedToken,
-                    token: normalizedToken,
-                    filePath,
-                    metadata: attachment.metadata && typeof attachment.metadata === 'object' ? attachment.metadata : {},
-                });
-
-                return list;
-            }, []);
-
-            const hasText = rawContent.trim().length > 0;
-
-            if (!hasText && attachments.length === 0) {
-                return;
-            }
-
-            const timestamp = new Date().toISOString();
-            const clientMessageId = uuidv4();
-
-            const fallbackContent = hasText ? rawContent : (attachments[0]?.fileName || '(Lampiran)');
-
+            const hasText = (data.content || '').trim().length > 0;
+            const atts = Array.isArray(data.attachments) ? data.attachments : [];
+            if (!hasText && atts.length === 0) return;
             const message = {
-                id: clientMessageId,
-                clientMessageId,
-                messageUuid: clientMessageId,
-                messageId: clientMessageId,
-                sessionId,
-                sessionUuid,
-                senderType: role === 'agent' ? 'admin' : 'customer',
-                senderId: role === "agent" ? actorId : null,
-                senderName: role === "agent" ? senderName : null,
-                messageType: hasText ? 'text' : 'attachment',
-                content: fallbackContent,
-                createdAt: timestamp,
+                id: uuidv4(), clientMessageId: uuidv4(), sessionId, sessionUuid, senderType: role === 'agent' ? 'admin' : 'customer',
+                senderId: role === "agent" ? actorId : null, senderName: role === "agent" ? senderName : null,
+                messageType: hasText ? 'text' : 'attachment', content: data.content || atts[0]?.fileName,
+                createdAt: new Date().toISOString(), attachments: atts, status: 'sent'
             };
-
-            message.attachments = attachments;
-
-            queueForPersistence({
-                action: 'message',
-                payload: message,
-            });
-
-            const outbound = {
-                type: 'callcenter:event',
-                payload: {
-                    kind: 'message',
-                    message,
-                },
-            };
-
-            broadcastToSession(sessionId, outbound);
-            publishRealtime(sessionId, outbound.payload);
+            appendHistoryCache(sessionId, message);
+            queueForPersistence({ action: 'message', payload: message });
+            const out = { type: 'callcenter:event', payload: { kind: 'message', message } };
+            broadcastToSession(sessionId, out);
+            publishRealtime(sessionId, out.payload);
             refreshSessionExpiry(sessionId, isPersistent);
             break;
         }
         case 'attachment': {
-            const attachment = data.attachment;
-            if (!attachment || typeof attachment !== 'object') {
-                return;
-            }
-
-            const attachmentId = Number(attachment.attachmentId || attachment.id || 0);
-            const fileName = typeof attachment.fileName === 'string' ? attachment.fileName : null;
-            const fileSize = Number(attachment.fileSize || 0);
-            const mimeType = typeof attachment.mimeType === 'string' ? attachment.mimeType : 'application/octet-stream';
-            const downloadToken = typeof attachment.downloadToken === 'string' ? attachment.downloadToken : null;
-            const filePath = typeof attachment.filePath === 'string' ? attachment.filePath : null;
-            const metadata = attachment.metadata && typeof attachment.metadata === 'object' ? attachment.metadata : {};
-
-            if (!attachmentId || !fileName || !downloadToken || !filePath) {
-                logWarning('Attachment payload missing required fields', { payload: attachment });
-                return;
-            }
-
-            const isTokenValid = verifyAttachmentToken(sessionId, filePath, downloadToken);
-            const normalizedToken = buildAttachmentTokenWithSecret(PRIMARY_ATTACHMENT_SECRET, sessionId, filePath);
-
-            if (!isTokenValid) {
-                logWarning('Attachment download token mismatch', {
-                    sessionId,
-                    attachmentId,
-                });
-            }
-
-            const timestamp = new Date().toISOString();
-            const clientMessageId = uuidv4();
+            const a = data.attachment; if (!a) return;
             const message = {
-                id: clientMessageId,
-                clientMessageId,
-                messageUuid: clientMessageId,
-                messageId: clientMessageId,
-                sessionId,
-                sessionUuid,
-                senderType: role === 'agent' ? 'admin' : 'customer',
-                senderId: role === "agent" ? actorId : null,
-                senderName: role === "agent" ? senderName : null,
-                messageType: 'attachment',
-                content: fileName,
-                createdAt: timestamp,
-                attachment: {
-                    id: attachmentId,
-                    fileName,
-                    fileSize,
-                    mimeType,
-                    downloadToken: normalizedToken,
-                    token: normalizedToken,
-                    filePath,
-                    metadata,
-                },
+                id: uuidv4(), clientMessageId: uuidv4(), sessionId, sessionUuid, senderType: role === 'agent' ? 'admin' : 'customer',
+                senderId: role === "agent" ? actorId : null, senderName: role === "agent" ? senderName : null,
+                messageType: 'attachment', content: a.fileName, createdAt: new Date().toISOString(), attachments: [a], status: 'sent'
             };
-
-            message.attachments = [message.attachment];
-
-            queueForPersistence({
-                action: 'message',
-                payload: message,
-            });
-
-            const outbound = {
-                type: 'callcenter:event',
-                payload: {
-                    kind: 'attachment',
-                    message,
-                },
-            };
-
-            broadcastToSession(sessionId, outbound);
-            publishRealtime(sessionId, outbound.payload);
+            appendHistoryCache(sessionId, message);
+            queueForPersistence({ action: 'message', payload: message });
+            const out = { type: 'callcenter:event', payload: { kind: 'attachment', message } };
+            broadcastToSession(sessionId, out);
+            publishRealtime(sessionId, out.payload);
             refreshSessionExpiry(sessionId, isPersistent);
             break;
         }
-        case "transfer": {
+        case "transfer":
             if (role !== "agent") return;
-            const targetAdminId = data.targetAdminId;
-            if (!targetAdminId) return;
-
-            queueForPersistence({
-                action: "transfer",
-                payload: {
-                    sessionId,
-                    sessionUuid,
-                    targetAdminId,
-                    actorId, senderName,
-                    emittedAt: new Date().toISOString(),
-                },
-            });
-
-            const outbound = {
-                type: "callcenter:event",
-                payload: {
-                    kind: "session_transferred",
-                    sessionId,
-                    sessionUuid,
-                    newAdminId: targetAdminId,
-                    previousAdminId: actorId, senderName,
-                    actorId, senderName,
-                },
-            };
-
-            broadcastToSession(sessionId, outbound);
-            publishRealtime(sessionId, outbound.payload);
+            queueForPersistence({ action: "transfer", payload: { sessionId, targetAdminId: data.targetAdminId } });
+            const tOut = { type: "callcenter:event", payload: { kind: "session_transferred", sessionId, newAdminId: data.targetAdminId } };
+            broadcastToSession(sessionId, tOut); publishRealtime(sessionId, tOut.payload);
             break;
-        }
-        case "hold": {
+        case "hold":
             if (role !== "agent") return;
-            queueForPersistence({
-                action: "hold",
-                payload: {
-                    sessionId,
-                    sessionUuid,
-                    actorId, senderName,
-                    emittedAt: new Date().toISOString(),
-                },
-            });
-
-            const outbound = {
-                type: "callcenter:event",
-                payload: {
-                    kind: "session_on_hold",
-                    sessionId,
-                    sessionUuid,
-                    actorId, senderName,
-                    status: "on_hold",
-                },
-            };
-
-            broadcastToSession(sessionId, outbound);
-            publishRealtime(sessionId, outbound.payload);
+            queueForPersistence({ action: "hold", payload: { sessionId } });
+            const hOut = { type: "callcenter:event", payload: { kind: "session_on_hold", sessionId, status: "on_hold" } };
+            broadcastToSession(sessionId, hOut); publishRealtime(sessionId, hOut.payload);
             break;
-        }
-        case "resume": {
+        case "resume":
             if (role !== "agent") return;
-            queueForPersistence({
-                action: "resume",
-                payload: {
-                    sessionId,
-                    sessionUuid,
-                    actorId, senderName,
-                    emittedAt: new Date().toISOString(),
-                },
-            });
-
-            const outbound = {
-                type: "callcenter:event",
-                payload: {
-                    kind: "session_resumed",
-                    sessionId,
-                    sessionUuid,
-                    actorId, senderName,
-                    status: "open",
-                },
-            };
-
-            broadcastToSession(sessionId, outbound);
-            publishRealtime(sessionId, outbound.payload);
-            break;
-        }
-        default:
+            queueForPersistence({ action: "resume", payload: { sessionId } });
+            const rOut = { type: "callcenter:event", payload: { kind: "session_resumed", sessionId, status: "open" } };
+            broadcastToSession(sessionId, rOut); publishRealtime(sessionId, rOut.payload);
             break;
     }
 }
 
 function cleanupConnection(ws) {
-    const meta = connectionMeta.get(ws);
-    if (!meta) {
-        return;
+    const meta = connectionMeta.get(ws); if (!meta) return;
+    if (meta.monitor) monitorConnections.delete(ws);
+    else {
+        const entry = sessionConnections.get(meta.sessionId);
+        if (entry) { entry.agents.delete(ws); entry.customers.delete(ws); if (entry.agents.size === 0 && entry.customers.size === 0) sessionConnections.delete(meta.sessionId); }
     }
-
-    if (meta.monitor) {
-        monitorConnections.delete(ws);
-        connectionMeta.delete(ws);
-        return;
-    }
-
-    const entry = sessionConnections.get(meta.sessionId);
-    if (entry) {
-        entry.agents.delete(ws);
-        entry.customers.delete(ws);
-        if (entry.agents.size === 0 && entry.customers.size === 0) {
-            sessionConnections.delete(meta.sessionId);
-        }
-    }
-
     connectionMeta.delete(ws);
 }
 
 function subscribeRealtimeChannel() {
-    realtimeSubscriber.psubscribe('callcenter:session:*', (err) => {
-        if (err) {
-            logError('Failed to subscribe call center channel', { error: err.message });
-        }
-    });
-
-    realtimeSubscriber.on('pmessage', (_pattern, _channel, message) => {
-        let payload;
-        try {
-            payload = JSON.parse(message);
-        } catch (error) {
-            logWarning('Invalid realtime message payload', { error: error.message });
-            return;
+    realtimeSubscriber.psubscribe('callcenter:session:*');
+    realtimeSubscriber.on('pmessage', (_p, _ch, msg) => {
+        let payload; try { payload = JSON.parse(msg); } catch (e) { return; }
+        if (payload.sourceNode === NODE_ID) return;
+        const sid = payload.sessionId; if (!sid) return;
+        const entry = sessionConnections.get(sid);
+        
+        if (payload.kind === 'messages_read' && entry) { 
+            broadcastToSession(sid, { type: 'read_receipt', readerType: payload.readerType, all: !!payload.all }); 
+            return; 
         }
 
-        if (payload.sourceNode && payload.sourceNode === NODE_ID) {
-            return;
+        if (payload.kind === 'message_persisted') { if (entry) broadcastToSession(sid, { type: 'callcenter:event', payload }); emitMonitorEvent('message_persisted', { sessionId: sid }); return; }
+        if (payload.kind === 'session_created') emitMonitorEvent('session_created', { sessionId: sid });
+        else if (payload.kind === 'session_claimed') emitMonitorEvent('session_claimed', { sessionId: sid });
+        else if (payload.kind === 'session_closed') {
+            emitMonitorEvent('session_closed', { sessionId: sid });
+            if (entry) { [...entry.agents, ...entry.customers].forEach(c => { try { c.close(1000); } catch (e) {} }); sessionConnections.delete(sid); }
         }
-
-        const sessionId = payload.sessionId;
-        if (!sessionId) {
-            return;
-        }
-
-        const entry = sessionConnections.get(sessionId);
-
-        if (payload.kind === 'message_persisted') {
-            if (entry) {
-                broadcastToSession(sessionId, {
-                    type: 'callcenter:event',
-                    payload,
-                });
-            }
-
-            emitMonitorEvent('message_persisted', {
-                sessionId,
-                messageId: payload.messageId || null,
-            });
-
-            return;
-        }
-
-        if (payload.kind === 'session_created') {
-            emitMonitorEvent('session_created', {
-                sessionId,
-                status: payload.status || 'pending',
-            });
-        } else if (payload.kind === 'session_claimed') {
-            emitMonitorEvent('session_claimed', {
-                sessionId,
-                actor: 'agent',
-                userId: payload.actorId || null,
-                assignedAdminId: payload.assignedAdminId || null,
-            });
-        } else if (payload.kind === 'session_closed') {
-            emitMonitorEvent('session_closed', {
-                sessionId,
-                reason: payload.reason || null,
-                source: payload.sourceNode || null,
-            });
-        } else if (payload.kind === 'upload_permission') {
-            emitMonitorEvent('upload_permission', {
-                sessionId,
-                allow: !!payload.allow,
-            });
-        } else if (payload.kind === 'persistence_toggled') {
-            emitMonitorEvent('persistence_toggled', {
-                sessionId,
-                isPersistent: !!payload.isPersistent,
-            });
-        }
-
-        if (!entry) {
-            return;
-        }
-
-        const outbound = {
-            type: 'callcenter:event',
-            payload,
-        };
-
-        broadcastToSession(sessionId, outbound);
-
-        if (payload.kind === 'session_closed') {
-            clearSessionExpiry(sessionId);
-            [...entry.agents, ...entry.customers].forEach((client) => {
-                try { client.close(1000, 'Session closed'); } catch (_) {}
-            });
-            sessionConnections.delete(sessionId);
-        } else if (payload.kind === 'upload_permission') {
-            broadcastToSession(sessionId, {
-                type: 'callcenter:event',
-                payload,
-            });
-        } else if (payload.kind === 'persistence_toggled') {
-            const isPersistent = !!payload.isPersistent;
-            [...entry.agents, ...entry.customers].forEach((client) => {
-                const meta = connectionMeta.get(client);
-                if (meta) {
-                    meta.isPersistent = isPersistent;
-                    connectionMeta.set(client, meta);
-                }
-            });
-            if (isPersistent) {
-                clearSessionExpiry(sessionId);
-            } else {
-                refreshSessionExpiry(sessionId, false);
-            }
-        }
+        if (entry) broadcastToSession(sid, { type: 'callcenter:event', payload });
     });
 }
 
 subscribeRealtimeChannel();
-initExpiryMonitor();
-
 function handleCallCenter(ws, user) {
-    const callCenterData = user.callCenter;
-    if (!callCenterData || !callCenterData.sessionId) {
-        logWarning('Missing call center data in websocket token');
-        try { ws.close(4403, 'Unauthorized'); } catch (_) {}
-        return;
-    }
-
-    const sessionId = callCenterData.sessionId;
-    const role = callCenterData.role || 'customer';
-    const sessionUuid = callCenterData.sessionUuid;
-    const userId = user.userId;
-    const actorId = user.actorId || null;
-    const senderName = callCenterData.senderName || null;
-    const isPersistent = !!callCenterData.isPersistent;
-
-    const entry = ensureSessionEntry(sessionId);
-    if (role === 'agent') {
-        entry.agents.add(ws);
-    } else {
-        entry.customers.add(ws);
-    }
-
-    connectionMeta.set(ws, {
-        sessionId,
-        role,
-        sessionUuid,
-        userId,
-        actorId, senderName,
-        isPersistent,
-    });
-
-    refreshSessionExpiry(sessionId, isPersistent);
-
-    ws.on('message', (raw) => handleInboundMessage(ws, connectionMeta.get(ws), raw));
+    const cd = user.callCenter; if (!cd || !cd.sessionId) return;
+    const entry = ensureSessionEntry(cd.sessionId);
+    if (cd.role === 'agent') entry.agents.add(ws); else entry.customers.add(ws);
+    connectionMeta.set(ws, { sessionId: cd.sessionId, role: cd.role, sessionUuid: cd.sessionUuid, actorId: user.actorId, senderName: cd.senderName, isPersistent: !!cd.isPersistent });
+    refreshSessionExpiry(cd.sessionId, !!cd.isPersistent);
+    ws.on('message', r => handleInboundMessage(ws, connectionMeta.get(ws), r));
     ws.on('close', () => cleanupConnection(ws));
-    ws.on('error', (error) => logWarning('Call center websocket error', { error: error.message }));
-
-    logInfo('Call center connection established', {
-        sessionId,
-        role,
-        userId,
-        actorId, senderName,
-        isPersistent,
-    });
-
-    ws.send(JSON.stringify({
-        type: 'callcenter:event',
-        payload: {
-            kind: 'connected',
-            sessionId,
-            role,
-        },
-    }));
-
-    if (role === 'customer') {
-        emitMonitorEvent('session_connected', {
-            sessionId,
-            sessionUuid,
-            actor: 'customer',
-            userId,
-        });
-    } else if (role === 'agent') {
-        emitMonitorEvent('session_claimed', {
-            sessionId,
-            actor: 'agent',
-            userId,
-        });
-    }
+    ws.send(JSON.stringify({ type: 'callcenter:event', payload: { kind: 'connected', sessionId: cd.sessionId, role: cd.role } }));
+    if (cd.role === 'customer') emitMonitorEvent('session_connected', { sessionId: cd.sessionId });
 }
 
 function handleCallCenterAdminBroadcast(ws, user) {
-    const callCenterData = user.callCenter;
-    if (!callCenterData || callCenterData.role !== 'admin_monitor') {
-        logWarning('Unauthorized monitor connection attempt', { userId: user.userId });
-        try { ws.close(4403, 'Unauthorized'); } catch (_) {}
-        return;
-    }
-
-    monitorConnections.add(ws);
-    connectionMeta.set(ws, { monitor: true, userId: user.userId });
-
+    if (user.callCenter?.role !== 'admin_monitor') return;
+    monitorConnections.add(ws); connectionMeta.set(ws, { monitor: true });
     ws.on('close', () => cleanupConnection(ws));
-    ws.on('error', (error) => logWarning('Call center monitor websocket error', { error: error.message }));
-
-    logInfo('Call center monitor connection established', {
-        userId: user.userId,
-    });
-
-    try {
-        ws.send(JSON.stringify({
-            type: 'callcenter:dashboard',
-            payload: {
-                event: 'monitor_connected',
-                emittedAt: new Date().toISOString(),
-                userId: user.userId,
-            },
-        }));
-    } catch (error) {
-        logWarning('Failed sending monitor acknowledgement', { error: error.message });
-    }
 }
 
-module.exports = {
-    handleCallCenter,
-    handleCallCenterAdminBroadcast,
-};
+module.exports = { handleCallCenter, handleCallCenterAdminBroadcast };

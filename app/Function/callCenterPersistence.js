@@ -5,393 +5,94 @@ const { logInfo, logError, logWarning } = require('../Helper/errorHandler');
 
 const CALL_CENTER_TIMEZONE = process.env.CALL_CENTER_TIMEZONE || process.env.TZ || 'Asia/Jakarta';
 
+const redisConfig = {
+    host: process.env.REDIS_HOST || '127.0.0.1',
+    port: Number(process.env.REDIS_PORT || 6379),
+};
+
+const queueRedis = new Redis({ ...redisConfig, db: 2 });
+const historyRedis = new Redis({ ...redisConfig, db: 4 }); // DB 4 untuk cache history & buffer
+const settingsRedis = new Redis(redisConfig);
+
 const DEFAULT_SETTINGS = {
     enabled: true,
     timezone: CALL_CENTER_TIMEZONE,
     schedule: [],
 };
 
-const QUEUE_LENGTH_SAMPLE_INTERVAL = Math.max(Number(process.env.CALL_CENTER_QUEUE_SAMPLE_INTERVAL || 20), 1);
-
 const EXPIRY_KEY_PREFIX = process.env.CALL_CENTER_EXPIRY_KEY_PREFIX || 'callcenter:session:expiry:';
-const EXPIRY_DB = Number(process.env.CALL_CENTER_EXPIRY_DB || 3);
-const SESSION_INACTIVITY_TTL = Number(process.env.CALL_CENTER_INACTIVE_TIMEOUT_SECONDS || 900);
-const PRIMARY_ATTACHMENT_SECRET = process.env.LIVECHAT_ATTACHMENT_SECRET
-    || process.env.ENCRYPTION_KEY
-    || 'livechat-secret';
 
-const ATTACHMENT_SECRETS = [
-    PRIMARY_ATTACHMENT_SECRET,
-    process.env.ENCRYPTION_KEY,
-].filter((value, index, array) => typeof value === 'string' && value.length > 0 && array.indexOf(value) === index);
-
-const DAY_INDEX = {
-    sun: 0,
-    mon: 1,
-    tue: 2,
-    wed: 3,
-    thu: 4,
-    fri: 5,
-    sat: 6,
-};
-
-function timeToMinutes(value) {
-    if (!value || typeof value !== 'string') {
-        return 0;
-    }
-    const [hour, minute] = value.split(':').map((part) => parseInt(part, 10));
-    if (Number.isNaN(hour) || Number.isNaN(minute)) {
-        return 0;
-    }
-    return hour * 60 + minute;
-}
-
-function normaliseSchedule(schedule = []) {
-    return schedule
-        .map((entry) => {
-            const days = Array.isArray(entry.days)
-                ? entry.days.map((day) => (typeof day === 'string' ? DAY_INDEX[day.slice(0, 3).toLowerCase()] : Number(day))).filter((day) => day >= 0 && day <= 6)
-                : [];
-
-            const start = timeToMinutes(entry.start || '00:00');
-            const end = timeToMinutes(entry.end || '23:59');
-
-            if (days.length === 0) {
-                return null;
-            }
-
-            return {
-                days,
-                start,
-                end,
-            };
-        })
-        .filter(Boolean);
-}
-
-function buildAttachmentToken(sessionId, filePath) {
-    if (!sessionId || !filePath) {
-        return null;
-    }
-
+function normalizeTimestamp(value) {
+    if (!value) return new Date().toISOString().slice(0, 19).replace('T', ' ');
     try {
-        return crypto
-            .createHmac('sha256', PRIMARY_ATTACHMENT_SECRET)
-            .update(`${sessionId}|${filePath}`)
-            .digest('hex');
-    } catch (error) {
-        logWarning('Failed to build attachment token', {
-            sessionId,
-            filePath,
-            error: error.message,
-        });
-        return null;
+        const d = new Date(value);
+        return d.toISOString().slice(0, 19).replace('T', ' ');
+    } catch (e) {
+        return new Date().toISOString().slice(0, 19).replace('T', ' ');
     }
-}
-
-function isWithinSchedule(settings) {
-    if (!settings.enabled) {
-        return false;
-    }
-
-    if (!settings.schedule || settings.schedule.length === 0) {
-        return true;
-    }
-
-    const timezone = settings.timezone || 'UTC';
-
-    const formatter = new Intl.DateTimeFormat('en-GB', {
-        timeZone: timezone,
-        weekday: 'short',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-    });
-
-    const now = new Date();
-    const parts = formatter.formatToParts(now);
-
-    const weekdayPart = parts.find((part) => part.type === 'weekday');
-    const hourPart = parts.find((part) => part.type === 'hour');
-    const minutePart = parts.find((part) => part.type === 'minute');
-
-    if (!weekdayPart || !hourPart || !minutePart) {
-        return true;
-    }
-
-    const day = DAY_INDEX[weekdayPart.value.slice(0, 3).toLowerCase()];
-    const minutesOfDay = parseInt(hourPart.value, 10) * 60 + parseInt(minutePart.value, 10);
-
-    return settings.schedule.some((slot) => {
-        if (!slot.days.includes(day)) {
-            return false;
-        }
-
-        if (slot.start <= slot.end) {
-            return minutesOfDay >= slot.start && minutesOfDay < slot.end;
-        }
-
-        // Overnight schedule
-        return minutesOfDay >= slot.start || minutesOfDay < slot.end;
-    });
-}
-
-function createMysqlPool() {
-    return mysql.createPool({
-        host: process.env.DB_HOST || 'localhost',
-        user: process.env.DB_USER || 'root',
-        password: process.env.DB_PASSWORD || '',
-        database: process.env.DB_NAME_CALL || 'siroum_call',
-        charset: 'utf8mb4',
-        waitForConnections: true,
-        connectionLimit: Number(process.env.CALL_CENTER_DB_POOL || 4),
-        queueLimit: 0,
-    });
-}
-
-function formatDateToTimezone(date, timezone) {
-    try {
-        const formatter = new Intl.DateTimeFormat('en-GB', {
-            timeZone: timezone,
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false,
-        });
-
-        const parts = formatter.formatToParts(date);
-        const getPart = (type) => {
-            const part = parts.find((entry) => entry.type === type);
-            return part ? part.value : null;
-        };
-
-        const year = getPart('year');
-        const month = getPart('month');
-        const day = getPart('day');
-        const hour = getPart('hour');
-        const minute = getPart('minute');
-        const second = getPart('second');
-
-        if ([year, month, day, hour, minute, second].some((part) => typeof part !== 'string')) {
-            const fallback = date.toLocaleString('sv-SE', { timeZone: timezone, hour12: false });
-            return fallback.replace('T', ' ');
-        }
-
-        return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
-    } catch (_) {
-        const fallback = date.toLocaleString('sv-SE', { timeZone: timezone, hour12: false });
-        return fallback.replace('T', ' ');
-    }
-}
-
-function normalizeTimestamp(value, timezone = CALL_CENTER_TIMEZONE) {
-    let date;
-
-    if (value instanceof Date) {
-        date = value;
-    } else if (typeof value === 'number') {
-        date = new Date(value);
-    } else if (value && typeof value === 'string' && value.trim() !== '') {
-        const parsed = new Date(value);
-        date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
-    } else {
-        date = new Date();
-    }
-
-    if (Number.isNaN(date.getTime())) {
-        date = new Date();
-    }
-
-    return formatDateToTimezone(date, timezone);
 }
 
 async function persistMessage(pool, publisher, message) {
     const createdAt = normalizeTimestamp(message.createdAt);
 
-    const attachmentsInput = [];
-    if (Array.isArray(message.attachments)) {
-        message.attachments.forEach((item) => attachmentsInput.push(item));
-    }
-    if (message.attachment) {
-        attachmentsInput.push(message.attachment);
-    }
-
-    const attachmentsPresent = attachmentsInput.length > 0;
-    const normalizedContent = (() => {
-        if (typeof message.content === 'string' && message.content.trim() !== '') {
-            return message.content;
+    let currentStatus = message.status || 'sent';
+    try {
+        const cachedHistory = await historyRedis.lrange(`chat:history:${message.sessionId}`, -10, -1);
+        for (const raw of cachedHistory) {
+            const m = JSON.parse(raw);
+            if (m.clientMessageId === message.clientMessageId && m.status === 'read') {
+                currentStatus = 'read';
+                break;
+            }
         }
+    } catch (e) {}
 
-        if (!attachmentsPresent) {
-            return '';
-        }
-
-        const primaryAttachment = attachmentsInput[0] || {};
-        return (
-            primaryAttachment.original_name
-            || primaryAttachment.file_name
-            || primaryAttachment.fileName
-            || '(Lampiran)'
-        );
-    })();
-
-    const normalizedMessageType = (() => {
-        const declaredType = typeof message.messageType === 'string' && message.messageType.trim() !== ''
-            ? message.messageType
-            : null;
-
-        if (declaredType) {
-            return declaredType;
-        }
-
-        return attachmentsPresent ? 'attachment' : 'text';
-    })();
-
-    let primaryAttachmentId = null;
-    const linkedAttachmentIds = [];
-
-    for (const attachment of attachmentsInput) {
-        const candidateId = Number(attachment.id || attachment.attachmentId || 0);
-        if (candidateId > 0) {
-            primaryAttachmentId = candidateId;
-            linkedAttachmentIds.push(candidateId);
-            break;
-        }
-    }
+    const attachmentsInput = Array.isArray(message.attachments) ? message.attachments : [];
+    let primaryAttachmentId = attachmentsInput.length > 0 ? Number(attachmentsInput[0].id || attachmentsInput[0].attachmentId || 0) : null;
 
     const connection = await pool.getConnection();
     try {
         const [insertResult] = await connection.execute(
-            `INSERT INTO call_center_messages (session_id, sender_type, sender_id, message_type, content, metadata, created_at, updated_at, attachment_id)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? FROM call_center_sessions WHERE id = ?`,
+            `INSERT INTO call_center_messages (session_id, sender_type, sender_id, message_type, status, content, metadata, created_at, updated_at, attachment_id)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM call_center_sessions WHERE id = ?`,
             [
-                message.sessionId,
-                message.senderType,
-                message.senderId,
-                normalizedMessageType,
-                normalizedContent,
-                message.metadata ? JSON.stringify(message.metadata) : null,
-                createdAt,
-                createdAt,
-                primaryAttachmentId,
-                message.sessionId,
+                message.sessionId, message.senderType, message.senderId, message.messageType,
+                currentStatus, message.content, message.metadata ? JSON.stringify(message.metadata) : null,
+                createdAt, createdAt, primaryAttachmentId, message.sessionId,
             ],
         );
 
-        if (insertResult.affectedRows === 0) {
-            logWarning('Call center persistence: unknown session id', { sessionId: message.sessionId });
-            return;
-        }
+        if (insertResult.affectedRows === 0) return;
 
-        let resolvedAttachmentId = primaryAttachmentId;
+        await publisher.publish(`callcenter:session:${message.sessionId}`, JSON.stringify({
+            kind: 'message_persisted', sessionId: message.sessionId, messageUuid: message.clientMessageId,
+            messageId: insertResult.insertId, id: insertResult.insertId, sourceNode: 'callcenter:persistence'
+        }));
+
         if (attachmentsInput.length) {
-            for (const attachment of attachmentsInput) {
-                const attachmentId = Number(attachment.id || attachment.attachmentId || 0);
-
-                if (attachmentId) {
-                    await connection.execute(
-                        'UPDATE call_center_attachments SET message_id = ?, updated_at = ?, metadata = COALESCE(?, metadata) WHERE id = ?',
-                        [
-                            insertResult.insertId,
-                            normalizeTimestamp(attachment.updated_at || attachment.created_at || createdAt),
-                            attachment.metadata ? JSON.stringify(attachment.metadata) : null,
-                            attachmentId,
-                        ],
-                    );
-                    linkedAttachmentIds.push(attachmentId);
-                    if (!resolvedAttachmentId) {
-                        resolvedAttachmentId = attachmentId;
-                    }
-                } else {
-                    const [attachmentResult] = await connection.execute(
-                        'INSERT INTO call_center_attachments (session_id, message_id, original_name, stored_name, mime_type, file_path, file_size, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                        [
-                            message.sessionId,
-                            insertResult.insertId,
-                            attachment.original_name || attachment.fileName || attachment.name || '-',
-                            attachment.stored_name || attachment.filePath || attachment.path || '',
-                            attachment.mime_type || attachment.mimeType || 'application/octet-stream',
-                            attachment.file_path || attachment.filePath || attachment.path || '',
-                            attachment.file_size || attachment.fileSize || 0,
-                            attachment.metadata ? JSON.stringify(attachment.metadata) : null,
-                            normalizeTimestamp(attachment.created_at || createdAt),
-                            normalizeTimestamp(attachment.updated_at || createdAt),
-                        ],
-                    );
-                    if (!resolvedAttachmentId && attachmentResult && attachmentResult.insertId) {
-                        resolvedAttachmentId = Number(attachmentResult.insertId);
-                    }
-                    if (attachmentResult && attachmentResult.insertId) {
-                        const newId = Number(attachmentResult.insertId);
-                        linkedAttachmentIds.push(newId);
-                        attachment.attachmentId = newId;
-                        attachment.id = newId;
-                    }
+            for (const att of attachmentsInput) {
+                const aid = Number(att.id || att.attachmentId || 0);
+                if (aid > 0) {
+                    await connection.execute('UPDATE call_center_attachments SET message_id = ?, updated_at = ? WHERE id = ?', [insertResult.insertId, createdAt, aid]);
                 }
             }
         }
+    } finally {
+        connection.release();
+    }
+}
 
-        if (resolvedAttachmentId && resolvedAttachmentId !== primaryAttachmentId) {
+async function markMessagesAsRead(pool, payload) {
+    const connection = await pool.getConnection();
+    try {
+        const readAt = normalizeTimestamp(payload.readAt);
+        const msgId = Number(payload.messageId);
+        if (!isNaN(msgId)) {
             await connection.execute(
-                'UPDATE call_center_messages SET attachment_id = ? WHERE id = ?',
-                [resolvedAttachmentId, insertResult.insertId],
+                "UPDATE call_center_messages SET status = 'read', updated_at = ? WHERE session_id = ? AND sender_type != ? AND id <= ? AND status != 'read'",
+                [readAt, payload.sessionId, payload.readerType, msgId]
             );
         }
-
-        await connection.execute(
-            'UPDATE call_center_sessions SET last_message_at = ?, status = status, updated_at = ? WHERE id = ?',
-            [createdAt, createdAt, message.sessionId],
-        );
-
-        const uniqueAttachmentIds = Array.from(new Set(linkedAttachmentIds.filter((id) => Number.isFinite(id) && id > 0)));
-
-        const persistedEvent = {
-            kind: 'message_persisted',
-            sessionId: message.sessionId,
-            messageUuid: message.id,
-            clientMessageId: message.id,
-            messageId: insertResult.insertId,
-            id: insertResult.insertId,
-            attachmentIds: uniqueAttachmentIds,
-            sourceNode: 'callcenter:persistence',
-        };
-
-        if (attachmentsInput.length) {
-            persistedEvent.attachments = attachmentsInput
-                .map((item) => {
-                    const attachmentId = Number(item.attachmentId || item.id || 0);
-                    if (!Number.isFinite(attachmentId) || attachmentId <= 0) {
-                        return null;
-                    }
-
-                    const filePath = item.file_path || item.filePath || item.path || '';
-                    const incomingToken = typeof item.downloadToken === 'string'
-                        ? item.downloadToken
-                        : (typeof item.token === 'string' ? item.token : null);
-
-                    const token = incomingToken || (filePath ? buildAttachmentToken(message.sessionId, filePath) : null);
-
-                    return {
-                        attachmentId,
-                        id: attachmentId,
-                        fileName: item.file_name || item.fileName || null,
-                        filePath,
-                        fileSize: Number(item.file_size || item.fileSize || 0),
-                        mimeType: item.mime_type || item.mimeType || 'application/octet-stream',
-                        token,
-                        downloadToken: token,
-                    };
-                })
-                .filter((item) => item && item.attachmentId);
-        }
-
-        await publisher.publish(
-            `callcenter:session:${message.sessionId}`,
-            JSON.stringify(persistedEvent),
-        );
     } finally {
         connection.release();
     }
@@ -399,407 +100,79 @@ async function persistMessage(pool, publisher, message) {
 
 async function closeSessionDueToInactivity(pool, sessionId) {
     const connection = await pool.getConnection();
-    const queueSessionIds = [];
-
     try {
-        await connection.beginTransaction();
-
-        const [sessions] = await connection.execute(
-            'SELECT id, status, is_persistent FROM call_center_sessions WHERE id = ? FOR UPDATE',
-            [sessionId],
-        );
-
-        if (!sessions || sessions.length === 0) {
-            await connection.rollback();
-            return { status: 'not_found' };
-        }
-
-        const session = sessions[0];
-        if (session.is_persistent) {
-            await connection.commit();
-            return { status: 'persistent_skip' };
-        }
-
-        if (session.status === 'closed') {
-            await connection.commit();
-            return { status: 'already_closed' };
-        }
-
-        const timestamp = normalizeTimestamp(new Date());
-
-        await connection.execute(
-            'UPDATE call_center_sessions SET status = ?, closed_at = ?, updated_at = ? WHERE id = ?',
-            ['closed', timestamp, timestamp, sessionId],
-        );
-
-        const [queueRows] = await connection.execute(
-            'SELECT id FROM live_chat_sessions WHERE call_center_session_id = ?',
-            [sessionId],
-        );
-
-        if (queueRows && queueRows.length > 0) {
-            for (const row of queueRows) {
-                queueSessionIds.push(row.id);
-            }
-
-            await connection.execute(
-                'UPDATE live_chat_sessions SET status = ?, queue_position = NULL, closed_at = ?, updated_at = ? WHERE call_center_session_id = ?',
-                ['closed', timestamp, timestamp, sessionId],
-            );
-        }
-
-        const [queuedRows] = await connection.execute(
-            'SELECT id FROM live_chat_sessions WHERE status = ? ORDER BY queue_position ASC, created_at ASC',
-            ['queued'],
-        );
-
-        if (queuedRows && queuedRows.length > 0) {
-            let position = 1;
-            for (const row of queuedRows) {
-                await connection.execute(
-                    'UPDATE live_chat_sessions SET queue_position = ? WHERE id = ?',
-                    [position, row.id],
-                );
-                position += 1;
-            }
-        }
-
-        await connection.commit();
-
-        return {
-            status: 'closed',
-            queueSessionIds,
-            timestamp,
-        };
-    } catch (error) {
-        try {
-            await connection.rollback();
-        } catch (_) {
-            // ignore rollback issues
-        }
-        throw error;
+        const [rows] = await connection.execute('SELECT id, status, is_persistent FROM call_center_sessions WHERE id = ?', [sessionId]);
+        if (!rows.length || rows[0].status === 'closed' || rows[0].is_persistent) return { status: 'ignored' };
+        const now = normalizeTimestamp(new Date());
+        await connection.execute('UPDATE call_center_sessions SET status = "closed", closed_at = ?, updated_at = ? WHERE id = ?', [now, now, sessionId]);
+        return { status: 'closed' };
     } finally {
         connection.release();
-    }
-}
-
-async function transferSession(pool, sessionId, targetAdminId) {
-    const connection = await pool.getConnection();
-    try {
-        const timestamp = normalizeTimestamp(new Date());
-        await connection.execute(
-            "UPDATE call_center_sessions SET assigned_admin_id = ?, status = \"open\", updated_at = ? WHERE id = ?",
-            [targetAdminId, timestamp, sessionId],
-        );
-        return true;
-    } finally {
-        connection.release();
-    }
-}
-
-async function holdSession(pool, sessionId) {
-    const connection = await pool.getConnection();
-    try {
-        const timestamp = normalizeTimestamp(new Date());
-        await connection.execute(
-            "UPDATE call_center_sessions SET status = \"on_hold\", updated_at = ? WHERE id = ?",
-            [timestamp, sessionId],
-        );
-        return true;
-    } finally {
-        connection.release();
-    }
-}
-
-async function resumeSession(pool, sessionId) {
-    const connection = await pool.getConnection();
-    try {
-        const timestamp = normalizeTimestamp(new Date());
-        await connection.execute(
-            "UPDATE call_center_sessions SET status = \"open\", updated_at = ? WHERE id = ?",
-            [timestamp, sessionId],
-        );
-        return true;
-    } finally {
-        connection.release();
-    }
-}
-
-function parseSettings(raw) {
-    try {
-        if (!raw) {
-            return { ...DEFAULT_SETTINGS, schedule: [] };
-        }
-
-        const parsed = JSON.parse(raw);
-        const merged = {
-            ...DEFAULT_SETTINGS,
-            ...parsed,
-        };
-
-        merged.schedule = normaliseSchedule(parsed.schedule || []);
-
-        return merged;
-    } catch (error) {
-        logWarning('Call center settings parse error', { error: error.message });
-        return { ...DEFAULT_SETTINGS, schedule: [] };
     }
 }
 
 function startCallCenterPersistence() {
-    const redisHost = process.env.REDIS_HOST || '127.0.0.1';
-    const redisPort = Number(process.env.REDIS_PORT || 6379);
-
-    const queueRedis = new Redis({
-        host: redisHost,
-        port: redisPort,
-        db: 2,
+    const mysqlPool = mysql.createPool({
+        host: process.env.DATABASE_HOST, user: process.env.DATABASE_USER, password: process.env.DATABASE_PASSWORD,
+        database: 'siroum_call', waitForConnections: true, connectionLimit: 10,
     });
 
-    const controlRedis = new Redis({
-        host: redisHost,
-        port: redisPort,
-    });
-
-    const settingsRedis = new Redis({
-        host: redisHost,
-        port: redisPort,
-    });
-
-    const eventPublisher = new Redis({
-        host: redisHost,
-        port: redisPort,
-    });
-
-    eventPublisher.on('error', (error) => {
-        logWarning('Call center event publisher redis error', { error: error.message });
-    });
-
-    const expiryRedis = SESSION_INACTIVITY_TTL > 0 ? new Redis({
-        host: redisHost,
-        port: redisPort,
-        db: EXPIRY_DB,
-    }) : null;
-
-    if (expiryRedis) {
-        expiryRedis.on('error', (error) => {
-            logWarning('Call center expiry redis error (persistence worker)', { error: error.message });
-        });
-    }
-
-    const mysqlPool = createMysqlPool();
-
+    const eventPublisher = new Redis(redisConfig);
     let running = true;
-    let settings = DEFAULT_SETTINGS;
-    let queueLengthSampleIndex = 0;
-    let lastQueueLength = null;
 
-    async function loadSettings() {
-        try {
-            const raw = await settingsRedis.get('callcenter:settings');
-            settings = parseSettings(raw);
-            logInfo('Call center settings updated', settings);
-        } catch (error) {
-            logWarning('Failed loading call center settings', { error: error.message });
-            settings = DEFAULT_SETTINGS;
+    async function processSync() {
+        const allItems = []; let raw;
+        while (raw = await queueRedis.lpop('callcenter:persistence')) { try { allItems.push(JSON.parse(raw)); } catch (e) {} }
+        if (!allItems.length) return;
+
+        const messages = allItems.filter(i => i.action === 'message').map(i => i.payload);
+        const readReceipts = allItems.filter(i => i.action === 'read').map(i => i.payload);
+        const expirations = allItems.filter(i => i.action === 'expire');
+        const others = allItems.filter(i => ['transfer', 'hold', 'resume'].includes(i.action));
+
+        const sessionIdsToClear = new Set();
+        allItems.forEach(i => { if (i.payload?.sessionId) sessionIdsToClear.add(Number(i.payload.sessionId)); });
+
+        if (messages.length) { for (const m of messages) await persistMessage(mysqlPool, eventPublisher, m); }
+        if (readReceipts.length) { for (const r of readReceipts) await markMessagesAsRead(mysqlPool, r); }
+        
+        for (const exp of expirations) {
+            const sid = Number(exp.payload?.sessionId); if (!sid) continue;
+            const res = await closeSessionDueToInactivity(mysqlPool, sid);
+            if (res.status === 'closed') await eventPublisher.publish(`callcenter:session:${sid}`, JSON.stringify({ kind: 'session_closed', sessionId: sid, reason: 'inactivity' }));
+        }
+
+        for (const act of others) {
+            const sid = Number(act.payload?.sessionId); if (!sid) continue;
+            const connection = await mysqlPool.getConnection();
+            try {
+                if (act.action === 'transfer') await connection.execute('UPDATE call_center_sessions SET assigned_admin_id = ?, updated_at = ? WHERE id = ?', [act.payload.targetAdminId, normalizeTimestamp(new Date()), sid]);
+                else if (act.action === 'hold') await connection.execute('UPDATE call_center_sessions SET status = "on_hold", updated_at = ? WHERE id = ?', [normalizeTimestamp(new Date()), sid]);
+                else if (act.action === 'resume') await connection.execute('UPDATE call_center_sessions SET status = "open", updated_at = ? WHERE id = ?', [normalizeTimestamp(new Date()), sid]);
+            } finally { connection.release(); }
+        }
+
+        for (const sid of sessionIdsToClear) {
+            await historyRedis.del(`chat:buffer:${sid}`);
+            logInfo(`Buffer cleared for session #${sid} after bulk sync`);
         }
     }
-
-    controlRedis.subscribe('callcenter:settings:reload', (err) => {
-        if (err) {
-            logWarning('Call center settings subscription failed', { error: err.message });
-        }
-    });
-
-    controlRedis.on('message', (channel) => {
-        if (channel === 'callcenter:settings:reload') {
-            loadSettings().catch((error) => {
-                logWarning('Call center settings reload failed', { error: error.message });
-            });
-        }
-    });
 
     async function processLoop() {
-        await loadSettings();
-        logInfo('Call center persistence worker embedded loop started');
-
+        logInfo('Call center bulk worker started');
         while (running) {
             try {
-                const result = await queueRedis.blpop('callcenter:persistence', 1);
-                if (!result) {
-                    continue;
+                const trigger = await queueRedis.blpop('callcenter:persistence', 0);
+                if (trigger) {
+                    await queueRedis.lpush('callcenter:persistence', trigger[1]);
+                    await new Promise(r => setTimeout(r, 30000));
+                    await processSync();
                 }
-
-                const [, raw] = result;
-                let payload;
-                try {
-                    payload = JSON.parse(raw);
-                } catch (error) {
-                    logError('Call center persistence: invalid JSON payload', { error: error.message });
-                    continue;
-                }
-
-                if (!payload || !payload.action) {
-                    continue;
-                }
-
-                if (payload.action === 'message') {
-                    if (!payload.payload) {
-                        continue;
-                    }
-
-                    if (!isWithinSchedule(settings)) {
-                        // push back and pause briefly until schedule window is open
-                        await queueRedis.rpush('callcenter:persistence', raw);
-                        await new Promise((resolve) => setTimeout(resolve, 1000));
-                        continue;
-                    }
-
-                    if (queueLengthSampleIndex === 0) {
-                        try {
-                            lastQueueLength = await queueRedis.llen('callcenter:persistence');
-                        } catch (error) {
-                            logWarning('Call center persistence: queue length sample failed', { error: error.message });
-                            lastQueueLength = null;
-                        }
-                    }
-                    queueLengthSampleIndex = (queueLengthSampleIndex + 1) % QUEUE_LENGTH_SAMPLE_INTERVAL;
-
-                    logInfo('Call center persistence dequeued message', {
-                        queueLength: lastQueueLength,
-                        sessionId: payload.payload.sessionId,
-                        createdAt: payload.payload.createdAt,
-                        senderType: payload.payload.senderType,
-                    });
-
-                    try {
-                        await persistMessage(mysqlPool, eventPublisher, payload.payload);
-                        logInfo('Call center persistence: message persisted', {
-                            messageId: payload.payload.id,
-                            sessionId: payload.payload.sessionId,
-                        });
-                    } catch (error) {
-                        logError('Call center persistence message error', {
-                            error: error.message,
-                            payload: payload.payload,
-                        });
-                    }
-                    continue;
-                }
-
-                if (['transfer', 'hold', 'resume'].includes(payload.action)) {
-                    const sessionId = Number(payload.payload && payload.payload.sessionId);
-                    if (!Number.isFinite(sessionId) || sessionId <= 0) {
-                        continue;
-                    }
-
-                    try {
-                        if (payload.action === 'transfer') {
-                            await transferSession(mysqlPool, sessionId, payload.payload.targetAdminId);
-                        } else if (payload.action === 'hold') {
-                            await holdSession(mysqlPool, sessionId);
-                        } else if (payload.action === 'resume') {
-                            await resumeSession(mysqlPool, sessionId);
-                        }
-
-                        logInfo("Call center persistence: session " + payload.action + " processed", { sessionId });
-                    } catch (error) {
-                        logError("Call center persistence " + payload.action + " error", {
-                            error: error.message,
-                            payload: payload.payload,
-                        });
-                    }
-                    continue;
-                }
-
-                if (payload.action === 'expire') {
-                    const sessionId = Number(payload.payload && payload.payload.sessionId);
-                    if (!Number.isFinite(sessionId) || sessionId <= 0) {
-                        logWarning('Call center persistence: invalid inactivity payload', { payload });
-                        continue;
-                    }
-
-                    if (expiryRedis) {
-                        try {
-                            const exists = await expiryRedis.exists(`${EXPIRY_KEY_PREFIX}${sessionId}`);
-                            if (exists) {
-                                logInfo('Skipping inactivity close because session heartbeat refreshed', { sessionId });
-                                continue;
-                            }
-                        } catch (error) {
-                            logWarning('Failed checking inactivity heartbeat key', { error: error.message, sessionId });
-                        }
-                    }
-
-                    try {
-                        const resultClose = await closeSessionDueToInactivity(mysqlPool, sessionId);
-                        if (resultClose.status === 'closed') {
-                            const eventPayload = {
-                                kind: 'session_closed',
-                                sessionId,
-                                reason: (payload.payload && payload.payload.reason) || 'inactivity',
-                                closedAt: new Date().toISOString(),
-                                sourceNode: 'callcenter:persistence',
-                            };
-
-                            await eventPublisher.publish(
-                                `callcenter:session:${sessionId}`,
-                                JSON.stringify(eventPayload),
-                            );
-
-                            logInfo('Call center session closed due to inactivity', {
-                                sessionId,
-                                queueSessionsClosed: resultClose.queueSessionIds.length,
-                            });
-                        } else if (resultClose.status === 'already_closed') {
-                            logInfo('Call center session already closed during inactivity handling', { sessionId });
-                        } else if (resultClose.status === 'not_found') {
-                            logWarning('Call center session not found for inactivity handling', { sessionId });
-                        }
-                    } catch (error) {
-                        logError('Call center inactivity close error', {
-                            error: error.message,
-                            sessionId,
-                        });
-                    }
-
-                    continue;
-                }
-
-                logWarning('Call center persistence: unknown action received', { action: payload.action });
-            } catch (error) {
-                logError('Call center persistence loop error', { error: error.message });
-                await new Promise((resolve) => setTimeout(resolve, 5000));
-            }
-        }
-
-        logInfo('Call center persistence worker stopping');
-        try {
-            await Promise.allSettled([
-                queueRedis.quit(),
-                controlRedis.quit(),
-                settingsRedis.quit(),
-                eventPublisher.quit(),
-                expiryRedis ? expiryRedis.quit() : Promise.resolve(),
-                mysqlPool.end(),
-            ]);
-        } catch (_) {
-            // ignore
+            } catch (e) { await new Promise(r => setTimeout(r, 5000)); }
         }
     }
-
-    processLoop().catch((error) => {
-        logError('Call center persistence fatal error', { error: error.message });
-    });
-
-    return {
-        stop() {
-            running = false;
-        },
-        reload: loadSettings,
-    };
+    processLoop().catch(e => logError('Fatal worker error', { error: e.message }));
+    return { stop() { running = false; } };
 }
 
-module.exports = {
-    startCallCenterPersistence,
-};
+module.exports = { startCallCenterPersistence };
