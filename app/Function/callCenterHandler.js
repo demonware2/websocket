@@ -80,8 +80,8 @@ const monitorConnections = new Set();
 
 const INACTIVITY_TTL_SECONDS = SESSION_INACTIVITY_TTL > 0 ? Math.max(SESSION_INACTIVITY_TTL, 30) : 0;
 
-function refreshSessionExpiry(sessionId) {
-    if (!expiryRedis || !sessionId || INACTIVITY_TTL_SECONDS <= 0) {
+function refreshSessionExpiry(sessionId, isPersistent = false) {
+    if (!expiryRedis || !sessionId || INACTIVITY_TTL_SECONDS <= 0 || isPersistent) {
         return;
     }
 
@@ -272,12 +272,12 @@ function handleInboundMessage(ws, meta, raw) {
         return;
     }
 
-    const { sessionId, role, sessionUuid, actorId } = meta;
+    const { sessionId, role, sessionUuid, actorId, senderName, isPersistent } = meta;
 
     switch (data.type) {
         case 'ping':
             ws.send(JSON.stringify({ type: 'pong', at: Date.now() }));
-            refreshSessionExpiry(sessionId);
+            refreshSessionExpiry(sessionId, isPersistent);
             break;
         case 'typing':
             publishRealtime(sessionId, {
@@ -349,7 +349,8 @@ function handleInboundMessage(ws, meta, raw) {
                 sessionId,
                 sessionUuid,
                 senderType: role === 'agent' ? 'admin' : 'customer',
-                senderId: role === 'agent' ? actorId : null,
+                senderId: role === "agent" ? actorId : null,
+                senderName: role === "agent" ? senderName : null,
                 messageType: hasText ? 'text' : 'attachment',
                 content: fallbackContent,
                 createdAt: timestamp,
@@ -372,7 +373,7 @@ function handleInboundMessage(ws, meta, raw) {
 
             broadcastToSession(sessionId, outbound);
             publishRealtime(sessionId, outbound.payload);
-            refreshSessionExpiry(sessionId);
+            refreshSessionExpiry(sessionId, isPersistent);
             break;
         }
         case 'attachment': {
@@ -414,7 +415,8 @@ function handleInboundMessage(ws, meta, raw) {
                 sessionId,
                 sessionUuid,
                 senderType: role === 'agent' ? 'admin' : 'customer',
-                senderId: role === 'agent' ? actorId : null,
+                senderId: role === "agent" ? actorId : null,
+                senderName: role === "agent" ? senderName : null,
                 messageType: 'attachment',
                 content: fileName,
                 createdAt: timestamp,
@@ -447,7 +449,93 @@ function handleInboundMessage(ws, meta, raw) {
 
             broadcastToSession(sessionId, outbound);
             publishRealtime(sessionId, outbound.payload);
-            refreshSessionExpiry(sessionId);
+            refreshSessionExpiry(sessionId, isPersistent);
+            break;
+        }
+        case "transfer": {
+            if (role !== "agent") return;
+            const targetAdminId = data.targetAdminId;
+            if (!targetAdminId) return;
+
+            queueForPersistence({
+                action: "transfer",
+                payload: {
+                    sessionId,
+                    sessionUuid,
+                    targetAdminId,
+                    actorId, senderName,
+                    emittedAt: new Date().toISOString(),
+                },
+            });
+
+            const outbound = {
+                type: "callcenter:event",
+                payload: {
+                    kind: "session_transferred",
+                    sessionId,
+                    sessionUuid,
+                    newAdminId: targetAdminId,
+                    previousAdminId: actorId, senderName,
+                    actorId, senderName,
+                },
+            };
+
+            broadcastToSession(sessionId, outbound);
+            publishRealtime(sessionId, outbound.payload);
+            break;
+        }
+        case "hold": {
+            if (role !== "agent") return;
+            queueForPersistence({
+                action: "hold",
+                payload: {
+                    sessionId,
+                    sessionUuid,
+                    actorId, senderName,
+                    emittedAt: new Date().toISOString(),
+                },
+            });
+
+            const outbound = {
+                type: "callcenter:event",
+                payload: {
+                    kind: "session_on_hold",
+                    sessionId,
+                    sessionUuid,
+                    actorId, senderName,
+                    status: "on_hold",
+                },
+            };
+
+            broadcastToSession(sessionId, outbound);
+            publishRealtime(sessionId, outbound.payload);
+            break;
+        }
+        case "resume": {
+            if (role !== "agent") return;
+            queueForPersistence({
+                action: "resume",
+                payload: {
+                    sessionId,
+                    sessionUuid,
+                    actorId, senderName,
+                    emittedAt: new Date().toISOString(),
+                },
+            });
+
+            const outbound = {
+                type: "callcenter:event",
+                payload: {
+                    kind: "session_resumed",
+                    sessionId,
+                    sessionUuid,
+                    actorId, senderName,
+                    status: "open",
+                },
+            };
+
+            broadcastToSession(sessionId, outbound);
+            publishRealtime(sessionId, outbound.payload);
             break;
         }
         default:
@@ -545,6 +633,11 @@ function subscribeRealtimeChannel() {
                 sessionId,
                 allow: !!payload.allow,
             });
+        } else if (payload.kind === 'persistence_toggled') {
+            emitMonitorEvent('persistence_toggled', {
+                sessionId,
+                isPersistent: !!payload.isPersistent,
+            });
         }
 
         if (!entry) {
@@ -569,6 +662,20 @@ function subscribeRealtimeChannel() {
                 type: 'callcenter:event',
                 payload,
             });
+        } else if (payload.kind === 'persistence_toggled') {
+            const isPersistent = !!payload.isPersistent;
+            [...entry.agents, ...entry.customers].forEach((client) => {
+                const meta = connectionMeta.get(client);
+                if (meta) {
+                    meta.isPersistent = isPersistent;
+                    connectionMeta.set(client, meta);
+                }
+            });
+            if (isPersistent) {
+                clearSessionExpiry(sessionId);
+            } else {
+                refreshSessionExpiry(sessionId, false);
+            }
         }
     });
 }
@@ -589,6 +696,8 @@ function handleCallCenter(ws, user) {
     const sessionUuid = callCenterData.sessionUuid;
     const userId = user.userId;
     const actorId = user.actorId || null;
+    const senderName = callCenterData.senderName || null;
+    const isPersistent = !!callCenterData.isPersistent;
 
     const entry = ensureSessionEntry(sessionId);
     if (role === 'agent') {
@@ -602,10 +711,11 @@ function handleCallCenter(ws, user) {
         role,
         sessionUuid,
         userId,
-        actorId,
+        actorId, senderName,
+        isPersistent,
     });
 
-    refreshSessionExpiry(sessionId);
+    refreshSessionExpiry(sessionId, isPersistent);
 
     ws.on('message', (raw) => handleInboundMessage(ws, connectionMeta.get(ws), raw));
     ws.on('close', () => cleanupConnection(ws));
@@ -615,7 +725,8 @@ function handleCallCenter(ws, user) {
         sessionId,
         role,
         userId,
-        actorId,
+        actorId, senderName,
+        isPersistent,
     });
 
     ws.send(JSON.stringify({

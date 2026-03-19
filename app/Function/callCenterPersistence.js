@@ -342,7 +342,7 @@ async function persistMessage(pool, publisher, message) {
         }
 
         await connection.execute(
-            'UPDATE call_center_sessions SET last_message_at = ?, status = IF(status = "pending", "open", status), updated_at = ? WHERE id = ?',
+            'UPDATE call_center_sessions SET last_message_at = ?, status = status, updated_at = ? WHERE id = ?',
             [createdAt, createdAt, message.sessionId],
         );
 
@@ -405,7 +405,7 @@ async function closeSessionDueToInactivity(pool, sessionId) {
         await connection.beginTransaction();
 
         const [sessions] = await connection.execute(
-            'SELECT id, status FROM call_center_sessions WHERE id = ? FOR UPDATE',
+            'SELECT id, status, is_persistent FROM call_center_sessions WHERE id = ? FOR UPDATE',
             [sessionId],
         );
 
@@ -415,6 +415,11 @@ async function closeSessionDueToInactivity(pool, sessionId) {
         }
 
         const session = sessions[0];
+        if (session.is_persistent) {
+            await connection.commit();
+            return { status: 'persistent_skip' };
+        }
+
         if (session.status === 'closed') {
             await connection.commit();
             return { status: 'already_closed' };
@@ -473,6 +478,48 @@ async function closeSessionDueToInactivity(pool, sessionId) {
             // ignore rollback issues
         }
         throw error;
+    } finally {
+        connection.release();
+    }
+}
+
+async function transferSession(pool, sessionId, targetAdminId) {
+    const connection = await pool.getConnection();
+    try {
+        const timestamp = normalizeTimestamp(new Date());
+        await connection.execute(
+            "UPDATE call_center_sessions SET assigned_admin_id = ?, status = \"open\", updated_at = ? WHERE id = ?",
+            [targetAdminId, timestamp, sessionId],
+        );
+        return true;
+    } finally {
+        connection.release();
+    }
+}
+
+async function holdSession(pool, sessionId) {
+    const connection = await pool.getConnection();
+    try {
+        const timestamp = normalizeTimestamp(new Date());
+        await connection.execute(
+            "UPDATE call_center_sessions SET status = \"on_hold\", updated_at = ? WHERE id = ?",
+            [timestamp, sessionId],
+        );
+        return true;
+    } finally {
+        connection.release();
+    }
+}
+
+async function resumeSession(pool, sessionId) {
+    const connection = await pool.getConnection();
+    try {
+        const timestamp = normalizeTimestamp(new Date());
+        await connection.execute(
+            "UPDATE call_center_sessions SET status = \"open\", updated_at = ? WHERE id = ?",
+            [timestamp, sessionId],
+        );
+        return true;
     } finally {
         connection.release();
     }
@@ -637,7 +684,31 @@ function startCallCenterPersistence() {
                             payload: payload.payload,
                         });
                     }
+                    continue;
+                }
 
+                if (['transfer', 'hold', 'resume'].includes(payload.action)) {
+                    const sessionId = Number(payload.payload && payload.payload.sessionId);
+                    if (!Number.isFinite(sessionId) || sessionId <= 0) {
+                        continue;
+                    }
+
+                    try {
+                        if (payload.action === 'transfer') {
+                            await transferSession(mysqlPool, sessionId, payload.payload.targetAdminId);
+                        } else if (payload.action === 'hold') {
+                            await holdSession(mysqlPool, sessionId);
+                        } else if (payload.action === 'resume') {
+                            await resumeSession(mysqlPool, sessionId);
+                        }
+
+                        logInfo("Call center persistence: session " + payload.action + " processed", { sessionId });
+                    } catch (error) {
+                        logError("Call center persistence " + payload.action + " error", {
+                            error: error.message,
+                            payload: payload.payload,
+                        });
+                    }
                     continue;
                 }
 

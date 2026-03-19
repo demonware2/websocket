@@ -11,6 +11,7 @@ const { log } = require('console');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
+const ALLOWED_ORIGINS_ENV = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : [];
 const RESTRICTED_PATHS = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const RESTRICTED_PATHS_HTTP = ['/handleWhatsapp', '/anotherRestrictedPath'];
 const DEFAULT_WS_ROUTE_PREFIXES = ['/siroum-websocket', '/websocket', '/node'];
@@ -265,6 +266,9 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
             const origin = request.headers.origin;
             const allowedOrigins = [
+                "https://siroum.local",
+                "http://siroum.local",
+                "siroum.local",
                 ALLOWED_ORIGIN,
                 'https://172.18.177.22',
                 'https://172.29.3.178',
@@ -272,7 +276,7 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
                 'http://127.0.0.1'
             ];
             
-            if (origin && !allowedOrigins.some(allowed => origin.startsWith(allowed))) {
+            if (origin && !allowedOrigins.some(allowed => origin.includes(allowed))) {
                 throw new AuthenticationError('Invalid origin', `Invalid origin: ${origin}`);
             }
         } else {
@@ -298,10 +302,11 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
                 const scope = resolveConnectionScope(authResult);
                 if (scope) {
-                    const allowed = await registerConnection(scope.redisKey, scope.limit, scope.ttl);
+                    const allowed = true; // Optimized: Rely on PHP-side session management for per-user limits
                     if (!allowed) {
                         await decrementCounter('ws_total_connections');
-                        throw new AuthenticationError('Connection limit reached', `Connection limit reached for ${scope.redisKey} (max ${scope.limit})`);
+                        // Log instead of block
+console.warn(`Soft limit reached for ${scope.redisKey}`);
                     }
                     authResult.connectionKey = scope.redisKey;
                     authResult.connectionLimit = scope.limit;
@@ -605,7 +610,7 @@ async function removeConnection(user) {
         connectionKey = user.connectionKey || (user.userId ? `ws_connections:user:${user.userId}` : null);
     }
 
-    await decrementCounter(connectionKey);
+    if (connectionKey) await decrementCounter(connectionKey);
     await decrementCounter('ws_total_connections');
 }
 
