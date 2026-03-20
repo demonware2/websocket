@@ -359,52 +359,6 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
             throw new AuthenticationError('Invalid request type', `Invalid request type for user ${decoded.userId}`);
         }
 
-        const isCallCenterCustomer = cleanRequestedPath === '/call-center/chat'
-            && decoded.callCenter
-            && decoded.callCenter.role === 'customer';
-
-        if (isCallCenterCustomer) {
-            const sessionId = Number(decoded.callCenter.sessionId || 0);
-            const authResult = {
-                ...decoded,
-                callCenterInternal: {
-                    sessionUuid: decoded.callCenter.sessionUuid,
-                    sessionId,
-                    role: 'customer',
-                },
-                roleId: null,
-                roles: [],
-            };
-
-            logInfo('Call center customer token accepted', {
-                userId: decoded.userId,
-                sessionId,
-            });
-
-            return authResult;
-        }
-
-        const isCallCenterMonitor = cleanRequestedPath === '/call-center/admin/broadcast'
-            && decoded.callCenter
-            && decoded.callCenter.role === 'admin_monitor';
-
-        if (isCallCenterMonitor) {
-            const authResult = {
-                ...decoded,
-                callCenterInternal: {
-                    role: 'admin_monitor',
-                },
-                roleId: null,
-                roles: Array.isArray(decoded.roles) ? decoded.roles : [],
-            };
-
-            logInfo('Call center admin monitor token accepted', {
-                userId: decoded.userId,
-            });
-
-            return authResult;
-        }
-
         const publicRoutes = Array.isArray(roleConfig.publicRoutes) ? roleConfig.publicRoutes : [];
         const isPublicRoute = publicRoutes.some((pattern) => matchesRoutePattern(pattern, cleanRequestedPath));
 
@@ -415,7 +369,7 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
         }
 
         if (!requiredRoles && !isPublicRoute) {
-            const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat', '/handleWhatsapp', '/call-center/chat', '/call-center/admin/broadcast'];
+            const allowedPaths = ['/handleSystemInfo', '/gatherPM2Data', '/handleChat', '/handleWhatsapp', ];
             if (!allowedPaths.includes(cleanRequestedPath)) {
                 throw new AuthenticationError('Route not configured', `Route not configured: ${cleanRequestedPath}`);
             }
@@ -497,16 +451,10 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
         const primaryRoleId = userRoles.length > 0 ? userRoles[0] : null;
         const authResult = { ...decoded, roleId: primaryRoleId, roles: userRoles };
 
-        if (cleanRequestedPath === '/call-center/chat') {
-            authResult.callCenterInternal = { role: 'agent' };
-            logInfo('Call center agent token accepted', {
-                userId: decoded.userId,
-                roles: userRoles,
-            });
-            return authResult;
-        }
-
-        logInfo(`Token verified for user ${decoded.userId} on path ${cleanRequestedPath}`);
+        logInfo('Authentication successful', {
+            userId: decoded.userId,
+            roles: userRoles,
+        });
 
         return authResult;
     } catch (error) {
