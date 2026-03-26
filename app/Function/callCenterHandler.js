@@ -172,7 +172,7 @@ function handleInboundMessage(ws, meta, raw) {
             const message = {
                 id: uuidv4(), clientMessageId: uuidv4(), sessionId, sessionUuid, senderType: role === 'agent' ? 'admin' : 'customer',
                 senderId: role === "agent" ? actorId : null, senderName: role === "agent" ? senderName : null,
-                messageType: hasText ? 'text' : 'attachment', content: data.content || atts[0]?.fileName,
+                messageType: data.messageType || (hasText ? 'text' : 'attachment'), content: data.content || atts[0]?.fileName,
                 createdAt: new Date().toISOString(), attachments: atts, status: 'sent'
             };
             appendHistoryCache(sessionId, message);
