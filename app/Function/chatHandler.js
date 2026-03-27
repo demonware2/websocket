@@ -57,6 +57,12 @@ async function handleChat(ws, user, request) {
                 case 'get_chat_history':
                     await handleGetChatHistory(userId, data.chatId, data.isGroup);
                     break;
+                case 'typing':
+                    await handleTyping(userId, data.to, data.groupId, data.isTyping);
+                    break;
+                case 'read_receipt':
+                    await handleReadReceipt(userId, data.to, data.groupId, data.messageId);
+                    break;
                 default:
                     ws.send(JSON.stringify({ error: 'Unknown message type' }));
             }
@@ -274,7 +280,6 @@ async function handleGetChatHistory(userId, chatId, isGroup) {
             );
         await connection.end();
 
-        // Combine and sort messages
         messages = [...messages, ...rows].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     }
 
@@ -284,5 +289,32 @@ async function handleGetChatHistory(userId, chatId, isGroup) {
     }
 }
 
+async function handleTyping(senderId, recipientId, groupId, isTyping) {
+    const payload = { type: 'typing', data: { senderId, isTyping, groupId } };
+    if (groupId) {
+        const members = await chatRedis.smembers(`group_members:${groupId}`);
+        for (const memberId of members) {
+            if (memberId !== senderId && connectedUsers.has(memberId)) {
+                connectedUsers.get(memberId).send(JSON.stringify(payload));
+            }
+        }
+    } else if (recipientId && connectedUsers.has(recipientId)) {
+        connectedUsers.get(recipientId).send(JSON.stringify(payload));
+    }
+}
+
+async function handleReadReceipt(senderId, recipientId, groupId, messageId) {
+    const payload = { type: 'read_receipt', data: { senderId, messageId, groupId } };
+    if (groupId) {
+        const members = await chatRedis.smembers(`group_members:${groupId}`);
+        for (const memberId of members) {
+            if (memberId !== senderId && connectedUsers.has(memberId)) {
+                connectedUsers.get(memberId).send(JSON.stringify(payload));
+            }
+        }
+    } else if (recipientId && connectedUsers.has(recipientId)) {
+        connectedUsers.get(recipientId).send(JSON.stringify(payload));
+    }
+}
 
 module.exports = { handleChat };

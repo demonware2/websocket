@@ -122,7 +122,20 @@ function startCallCenterPersistence() {
                     const connection = await mysqlPool.getConnection();
                     try {
                         if (action === 'read') {
-                            await connection.execute("UPDATE call_center_messages SET status = 'read', updated_at = ? WHERE session_id = ? AND sender_type != ? AND id <= ? AND status != 'read'", [normalizeTimestamp(payload.readAt), payload.sessionId, payload.readerType, Number(payload.messageId)]);
+                            const readAt = normalizeTimestamp(payload.readAt);
+                            if (payload.readerType === 'customer') {
+                                await connection.execute("UPDATE call_center_messages SET status = 'read', updated_at = ? WHERE session_id = ? AND sender_type = 'admin' AND id <= ? AND status != 'read'", [readAt, payload.sessionId, Number(payload.messageId)]);
+                            } else if (payload.readerType === 'admin') {
+                                await connection.execute("UPDATE call_center_messages SET status = 'read', updated_at = ? WHERE session_id = ? AND sender_type = 'customer' AND id <= ? AND status != 'read'", [readAt, payload.sessionId, Number(payload.messageId)]);
+                                if (payload.readerId) {
+                                    await connection.execute(`
+                                        UPDATE call_center_messages 
+                                        SET metadata = JSON_ARRAY_APPEND(IFNULL(metadata, '{"read_by":[]}'), '$.read_by', ?) 
+                                        WHERE session_id = ? AND sender_type = 'admin' AND sender_id != ? AND id <= ? 
+                                          AND (metadata IS NULL OR JSON_SEARCH(IFNULL(metadata, '{"read_by":[]}'), 'one', ?, null, '$.read_by') IS NULL)
+                                    `, [payload.readerId, payload.sessionId, payload.readerId, Number(payload.messageId), payload.readerId]);
+                                }
+                            }
                         } else if (action === 'transfer') {
                             await connection.execute('UPDATE call_center_sessions SET assigned_admin_id = ?, updated_at = ? WHERE id = ?', [payload.targetAdminId, normalizeTimestamp(new Date()), payload.sessionId]);
                         } else if (action === 'hold') {

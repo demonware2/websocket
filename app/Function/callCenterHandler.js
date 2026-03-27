@@ -161,9 +161,9 @@ function handleInboundMessage(ws, meta, raw) {
             broadcastToSession(sessionId, { type: 'typing', senderType: role === 'agent' ? 'admin' : 'customer' }, ws);
             break;
         case 'read_receipt':
-            broadcastToSession(sessionId, { type: 'read_receipt', messageId: data.messageId, senderType: role === 'agent' ? 'admin' : 'customer' }, ws);
+            broadcastToSession(sessionId, { type: 'read_receipt', messageId: data.messageId, senderType: role === 'agent' ? 'admin' : 'customer', readerId: actorId }, ws);
             markHistoryAsReadCache(sessionId, role === 'agent' ? 'admin' : 'customer', data.messageId);
-            queueForPersistence({ action: 'read', payload: { sessionId, messageId: data.messageId, readerType: role === 'agent' ? 'admin' : 'customer', readAt: new Date().toISOString() } });
+            queueForPersistence({ action: 'read', payload: { sessionId, messageId: data.messageId, readerType: role === 'agent' ? 'admin' : 'customer', readerId: actorId, readAt: new Date().toISOString() } });
             break;
         case 'message': {
             const hasText = (data.content || '').trim().length > 0;
@@ -245,6 +245,7 @@ function subscribeRealtimeChannel() {
         if (payload.kind === 'message_persisted') { if (entry) broadcastToSession(sid, { type: 'callcenter:event', payload }); emitMonitorEvent('message_persisted', { sessionId: sid }); return; }
         if (payload.kind === 'session_created') emitMonitorEvent('session_created', { sessionId: sid });
         else if (payload.kind === 'session_claimed') emitMonitorEvent('session_claimed', { sessionId: sid });
+        else if (payload.kind === 'admin_invited') emitMonitorEvent('admin_invited', payload);
         else if (payload.kind === 'session_closed') {
             emitMonitorEvent('session_closed', { sessionId: sid });
             if (entry) { [...entry.agents, ...entry.customers].forEach(c => { try { c.close(1000); } catch (e) {} }); sessionConnections.delete(sid); }
