@@ -336,11 +336,12 @@ function handlePresenceChannel({
     ws.on('message', (raw) => {
         try {
             const payload = typeof raw === 'string' ? JSON.parse(raw) : JSON.parse(raw.toString());
-            if (payload && payload.type === 'presence:ping') {
-                const state = ws[metaKey];
-                if (!state) {
-                    return;
-                }
+            if (!payload || !payload.type) return;
+
+            const state = ws[metaKey];
+            if (!state || !state.rppId) return;
+
+            if (payload.type === 'presence:ping') {
                 const currentRoom = store.get(state.rppId);
                 if (!currentRoom) {
                     return;
@@ -350,6 +351,12 @@ function handlePresenceChannel({
                     currentInfo.lastSeen = Date.now();
                     currentRoom.users.set(state.userId, currentInfo);
                 }
+            } else if (payload.type.startsWith('presence:')) {
+                broadcastFn(state.rppId, {
+                    ...payload,
+                    userId: state.userId,
+                    userName: state.userName
+                }, ws);
             }
         } catch (_) {
             // ignore invalid payloads for presence channel
