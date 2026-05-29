@@ -612,7 +612,7 @@ function gatherPM2Data(ws, user, request) {
             const data = await getAllDataPM2();
             safeSend(ws, { type: 'pm2Data', data });
         } catch (error) {
-            throw error;
+            logError('Failed to send PM2 data', { error: error.message });
         }
     };
 
@@ -621,7 +621,7 @@ function gatherPM2Data(ws, user, request) {
             const logs = await getLogsPM2(pm_id);
             safeSend(ws, { type: 'logs', pm_id, logs });
         } catch (error) {
-            throw error;
+            logError(`Failed to send PM2 logs for ${pm_id}`, { error: error.message });
         }
     };
 
