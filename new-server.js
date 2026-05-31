@@ -38,6 +38,10 @@ const redis = new Redis({
 const connections = new Map();
 const callCenterPersistence = startCallCenterPersistence();
 
+const kajianPresenceRooms = new Map();
+const penetapanPresenceRooms = new Map();
+const PRESENCE_QUEUE_KEY = 'kajian_activity_queue';
+
 function safeLog(level, message, data = {}) {
     const meta = typeof data === 'object' ? data : { data };
     switch ((level || 'info').toLowerCase()) {
@@ -98,6 +102,342 @@ async function saveEditorContent(rppId, content, userId) {
         handleError(error, 'Database saveEditorContent');
         return false;
     }
+}
+
+function presenceRandomId() {
+    return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function getPresenceRoom(store, rppId) {
+    if (!store.has(rppId)) {
+        store.set(rppId, {
+            clients: new Set(),
+            users: new Map(),
+        });
+    }
+    return store.get(rppId);
+}
+
+function getKajianPresenceRoom(rppId) {
+    return getPresenceRoom(kajianPresenceRooms, rppId);
+}
+
+function getPenetapanPresenceRoom(rppId) {
+    return getPresenceRoom(penetapanPresenceRooms, rppId);
+}
+
+function presenceSafeSend(ws, payload) {
+    try {
+        if (!ws || ws.readyState !== ws.OPEN) {
+            return false;
+        }
+        const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+        ws.send(data);
+        return true;
+    } catch (error) {
+        logWarning('Presence send failed', { message: error.message });
+        return false;
+    }
+}
+
+function serializePresenceUsers(room, excludeUserId = null) {
+    const users = [];
+    room.users.forEach((info, userId) => {
+        if (excludeUserId && userId === excludeUserId) {
+            return;
+        }
+        users.push({ userId, userName: info.userName });
+    });
+    return users;
+}
+
+function broadcastPresence(store, rppId, payload, excludeWs = null) {
+    const room = store.get(rppId);
+    if (!room) {
+        return;
+    }
+    room.clients.forEach((clientWs) => {
+        if (clientWs !== excludeWs) {
+            presenceSafeSend(clientWs, payload);
+        }
+    });
+}
+
+function broadcastKajianPresence(rppId, payload, excludeWs = null) {
+    broadcastPresence(kajianPresenceRooms, rppId, payload, excludeWs);
+}
+
+function broadcastPenetapanPresence(rppId, payload, excludeWs = null) {
+    broadcastPresence(penetapanPresenceRooms, rppId, payload, excludeWs);
+}
+
+function truncateMeta(meta) {
+    if (!meta) {
+        return '';
+    }
+    if (typeof meta === 'string') {
+        return meta.length > 512 ? meta.slice(0, 512) : meta;
+    }
+    try {
+        const serialized = JSON.stringify(meta);
+        return serialized.length > 512 ? serialized.slice(0, 512) : serialized;
+    } catch (error) {
+        return '';
+    }
+}
+
+function enqueuePresenceActivity(event) {
+    if (!redis) {
+        logWarning('Presence activity skipped because Redis client is unavailable');
+        return Promise.resolve();
+    }
+
+    const payload = {
+        rppId: event.rppId || '',
+        userId: event.userId || '',
+        userName: event.userName || '',
+        action: event.action || '',
+        target: event.target || '',
+        meta: truncateMeta(event.meta),
+        createdAt: new Date().toISOString(),
+    };
+
+    const metaPreview = typeof payload.meta === 'string' ? payload.meta : JSON.stringify(payload.meta || '');
+    const preview = metaPreview && metaPreview.length > 120
+        ? `${metaPreview.slice(0, 120)}…`
+        : metaPreview;
+
+    logDebug('Queueing presence activity', {
+        queue: PRESENCE_QUEUE_KEY,
+        action: payload.action,
+        target: payload.target,
+        rppId: payload.rppId,
+        userId: payload.userId,
+        metaPreview: preview,
+    });
+
+    return redis.rpush(PRESENCE_QUEUE_KEY, JSON.stringify(payload))
+        .then((queueLength) => {
+            logInfo('Presence activity enqueued', {
+                queue: PRESENCE_QUEUE_KEY,
+                action: payload.action,
+                target: payload.target,
+                queueLength,
+            });
+            return queueLength;
+        })
+        .catch((error) => {
+            logWarning('Presence activity enqueue failed', {
+                message: error.message,
+                action: payload.action,
+                target: payload.target,
+            });
+        });
+}
+
+function detachPresence(ws, metaKey, store, broadcastFn, logPrefix) {
+    const meta = ws[metaKey];
+    if (!meta || meta.removed) {
+        return;
+    }
+
+    meta.removed = true;
+    const { rppId, userId } = meta;
+    const room = store.get(rppId);
+    if (!room) {
+        return;
+    }
+
+    room.clients.delete(ws);
+
+    const info = room.users.get(userId);
+    if (info) {
+        info.count -= 1;
+        if (info.count <= 0) {
+            room.users.delete(userId);
+            broadcastFn(rppId, {
+                type: 'presence:left',
+                user: { userId, userName: info.userName },
+            }, ws);
+        } else {
+            room.users.set(userId, info);
+        }
+    }
+
+    if (room.clients.size === 0) {
+        store.delete(rppId);
+    }
+
+    const leaveMeta = {
+        durationMs: meta.connectedAt ? Date.now() - meta.connectedAt : null,
+        connectionId: meta.connectionId,
+    };
+
+    logDebug(`${logPrefix} presence leave prepared`, {
+        rppId,
+        userId,
+        durationMs: leaveMeta.durationMs,
+        connectionId: leaveMeta.connectionId,
+    });
+
+    enqueuePresenceActivity({
+        rppId,
+        userId,
+        userName: meta.userName || (info && info.userName) || '',
+        action: `${logPrefix.toLowerCase()}_presence_leave`,
+        target: `${logPrefix.toLowerCase()}_presence`,
+        meta: leaveMeta,
+    });
+
+    logInfo(`${logPrefix} presence leave`, {
+        rppId,
+        userId,
+        durationMs: leaveMeta.durationMs,
+        connectionId: leaveMeta.connectionId,
+    });
+}
+
+function detachKajianPresence(ws) {
+    detachPresence(ws, '_kajianPresence', kajianPresenceRooms, broadcastKajianPresence, 'Kajian');
+}
+
+function detachPenetapanPresence(ws) {
+    detachPresence(ws, '_penetapanPresence', penetapanPresenceRooms, broadcastPenetapanPresence, 'Penetapan');
+}
+
+function handlePresenceChannel({
+    ws,
+    user,
+    rppId,
+    roomGetter,
+    store,
+    metaKey,
+    broadcastFn,
+    detachFn,
+    logPrefix,
+}) {
+    if (!rppId) {
+        logWarning(`${logPrefix} presence refused: missing rpp_id`);
+        try { ws.close(1008, 'Missing rpp_id'); } catch (_) {}
+        return;
+    }
+
+    const userId = user.uuid || user.userId || user.id;
+    if (!userId) {
+        logWarning(`${logPrefix} presence refused: missing user identifier`);
+        try { ws.close(1008, 'Missing user identifier'); } catch (_) {}
+        return;
+    }
+
+    const userName = user.name || user.username || 'Pengguna';
+    const room = roomGetter(rppId);
+    const connectionId = presenceRandomId();
+
+    ws[metaKey] = {
+        rppId,
+        userId,
+        userName,
+        connectionId,
+        removed: false,
+        connectedAt: Date.now(),
+    };
+
+    room.clients.add(ws);
+
+    const info = room.users.get(userId) || { userName, count: 0, lastSeen: 0 };
+    info.count += 1;
+    info.userName = userName;
+    info.lastSeen = Date.now();
+    room.users.set(userId, info);
+
+    logDebug(`${logPrefix} presence join`, { rppId, userId, connectionId });
+
+    presenceSafeSend(ws, {
+        type: 'presence:init',
+        users: serializePresenceUsers(room, userId),
+    });
+
+    broadcastFn(rppId, {
+        type: 'presence:join',
+        user: { userId, userName },
+    }, ws);
+
+    logDebug(`${logPrefix} presence join prepared`, {
+        rppId,
+        userId,
+        connectionId,
+    });
+
+    enqueuePresenceActivity({
+        rppId,
+        userId,
+        userName,
+        action: `${logPrefix.toLowerCase()}_presence_join`,
+        target: `${logPrefix.toLowerCase()}_presence`,
+        meta: { connectionId },
+    });
+
+    ws.on('message', (raw) => {
+        try {
+            const payload = typeof raw === 'string' ? JSON.parse(raw) : JSON.parse(raw.toString());
+            if (!payload || !payload.type) return;
+
+            const state = ws[metaKey];
+            if (!state || !state.rppId) return;
+
+            if (payload.type === 'presence:ping') {
+                const currentRoom = store.get(state.rppId);
+                if (!currentRoom) {
+                    return;
+                }
+                const currentInfo = currentRoom.users.get(state.userId);
+                if (currentInfo) {
+                    currentInfo.lastSeen = Date.now();
+                    currentRoom.users.set(state.userId, currentInfo);
+                }
+            } else if (payload.type.startsWith('presence:')) {
+                broadcastFn(state.rppId, {
+                    ...payload,
+                    userId: state.userId,
+                    userName: state.userName
+                }, ws);
+            }
+        } catch (_) {
+            // ignore invalid payloads for presence channel
+        }
+    });
+
+    const cleanup = () => detachFn(ws);
+    ws.once('close', cleanup);
+    ws.once('error', cleanup);
+}
+
+function handleKajianPresence(ws, user, rppId) {
+    handlePresenceChannel({
+        ws,
+        user,
+        rppId,
+        roomGetter: getKajianPresenceRoom,
+        store: kajianPresenceRooms,
+        metaKey: '_kajianPresence',
+        broadcastFn: broadcastKajianPresence,
+        detachFn: detachKajianPresence,
+        logPrefix: 'Kajian',
+    });
+}
+
+function handlePenetapanPresence(ws, user, rppId) {
+    handlePresenceChannel({
+        ws,
+        user,
+        rppId,
+        roomGetter: getPenetapanPresenceRoom,
+        store: penetapanPresenceRooms,
+        metaKey: '_penetapanPresence',
+        broadcastFn: broadcastPenetapanPresence,
+        detachFn: detachPenetapanPresence,
+        logPrefix: 'Penetapan',
+    });
 }
 
 class EditorHandler {
@@ -412,6 +752,46 @@ function handleConnection(ws, user, pathname, request) {
                 handleEditorConnection(ws, user, rppId, connectionId);
             } else {
                 safeLog('warn', 'Invalid editor route - missing rpp_id');
+                ws.close();
+            }
+        } else if (pathname === '/kajian-presence' || pathname.startsWith('/kajian-presence/')) {
+            let rppId = null;
+            if (pathname.startsWith('/kajian-presence/')) {
+                rppId = pathname.split('/')[2] || null;
+            }
+            if (!rppId) {
+                try {
+                    const url = new URL(request.url, `http://${request.headers.host}`);
+                    rppId = url.searchParams.get('rpp_id');
+                } catch (_) {
+                    rppId = null;
+                }
+            }
+
+            if (rppId) {
+                handleKajianPresence(ws, user, rppId);
+            } else {
+                safeLog('warn', 'Invalid kajian presence route - missing rpp_id');
+                ws.close();
+            }
+        } else if (pathname === '/penetapan-presence' || pathname.startsWith('/penetapan-presence/')) {
+            let rppId = null;
+            if (pathname.startsWith('/penetapan-presence/')) {
+                rppId = pathname.split('/')[2] || null;
+            }
+            if (!rppId) {
+                try {
+                    const url = new URL(request.url, `http://${request.headers.host}`);
+                    rppId = url.searchParams.get('rpp_id');
+                } catch (_) {
+                    rppId = null;
+                }
+            }
+
+            if (rppId) {
+                handlePenetapanPresence(ws, user, rppId);
+            } else {
+                safeLog('warn', 'Invalid penetapan presence route - missing rpp_id');
                 ws.close();
             }
         } else {
