@@ -47,6 +47,7 @@ async function flushToDatabase() {
       try {
         jobs.push(JSON.parse(jobData));
       } catch (e) {
+        console.error('>>> [dppChatPersistenceWorker] Failed to parse job JSON:', e.message, jobData);
         logError('Failed to parse queue job, skipping invalid JSON', { data: jobData });
       }
       count++;
@@ -56,6 +57,8 @@ async function flushToDatabase() {
       flushing = false;
       return;
     }
+
+    console.log(`>>> [dppChatPersistenceWorker] Retrieved ${jobs.length} jobs from queue`);
 
     const inserts = [];
     const deletes = [];
@@ -79,6 +82,7 @@ async function flushToDatabase() {
 
     const readList = Array.from(reads.values());
 
+    console.log(`>>> [dppChatPersistenceWorker] Processing: ${inserts.length} inserts, ${deletes.length} deletes, ${readList.length} read updates`);
     logInfo(`Flushing batched database sync: ${inserts.length} inserts, ${deletes.length} deletes, ${readList.length} read updates`);
 
     const connection = await pool.getConnection();
@@ -104,25 +108,30 @@ async function flushToDatabase() {
           );
         }
 
+        console.log(`>>> [dppChatPersistenceWorker] Executing query: INSERT IGNORE INTO rpp_pokja_chat ... with ${inserts.length} rows`);
         await connection.execute(
           `INSERT IGNORE INTO rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at) VALUES ${placeholders}`,
           params
         );
+        console.log(`>>> [dppChatPersistenceWorker] Successfully inserted ${inserts.length} messages`);
         logInfo(`Successfully bulk-inserted ${inserts.length} messages`);
       }
 
       // 2. Process batch deletes
       if (deletes.length > 0) {
         const placeholders = deletes.map(() => '?').join(', ');
+        console.log(`>>> [dppChatPersistenceWorker] Executing delete for ${deletes.length} messages`);
         await connection.execute(
           `DELETE FROM rpp_pokja_chat WHERE uuid IN (${placeholders})`,
           deletes
         );
+        console.log(`>>> [dppChatPersistenceWorker] Successfully deleted ${deletes.length} messages`);
         logInfo(`Successfully bulk-deleted ${deletes.length} messages`);
       }
 
       // 3. Process read status updates
       if (readList.length > 0) {
+        console.log(`>>> [dppChatPersistenceWorker] Processing ${readList.length} read status updates`);
         for (const read of readList) {
           const { rppId, userId, context, time } = read;
 
@@ -167,13 +176,16 @@ async function flushToDatabase() {
             }
           }
         }
+        console.log(`>>> [dppChatPersistenceWorker] Successfully updated read statuses`);
         logInfo(`Successfully updated read status for ${readList.length} users`);
       }
 
       await connection.commit();
+      console.log('>>> [dppChatPersistenceWorker] Transaction committed successfully');
     } catch (err) {
       await connection.rollback();
-      logError('Database transaction failed, processing retries for jobs', { error: err.message });
+      console.error('>>> [dppChatPersistenceWorker] Database transaction failed:', err);
+      logError('Database transaction failed, processing retries for jobs', { error: err.message, stack: err.stack });
 
       for (let i = jobs.length - 1; i >= 0; i--) {
         const job = jobs[i];
@@ -182,6 +194,7 @@ async function flushToDatabase() {
           job.error = err.message;
           job.failed_at = new Date().toISOString();
           await redis.rpush('dpp_chat_failed_jobs', JSON.stringify(job));
+          console.error(`>>> [dppChatPersistenceWorker] Job reached max retries. Moved to failed queue:`, job);
           logError(`Job reached max retries, moved to failed queue: ${job.action}`, { uuid: job.data?.uuid || job.uuid, error: err.message });
         } else {
           await redis.lpush('dpp_chat_persistence_queue', JSON.stringify(job));
@@ -191,7 +204,8 @@ async function flushToDatabase() {
       connection.release();
     }
   } catch (err) {
-    logError('Error executing flushToDatabase batch', { error: err.message });
+    console.error('>>> [dppChatPersistenceWorker] Outer connection error:', err);
+    logError('Error executing flushToDatabase batch', { error: err.message, stack: err.stack });
   }
 
   flushing = false;
