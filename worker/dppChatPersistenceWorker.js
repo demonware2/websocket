@@ -15,7 +15,7 @@ const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'siroum',
+  database: process.env.DB_NAME_DPP || 'dpp_pbj',
   charset: 'utf8mb4',
   acquireTimeout: 60000,
   timeout: 60000
@@ -105,7 +105,7 @@ async function flushToDatabase() {
         }
 
         await connection.execute(
-          `INSERT IGNORE INTO dpp_pbj.rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at) VALUES ${placeholders}`,
+          `INSERT IGNORE INTO rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at) VALUES ${placeholders}`,
           params
         );
         logInfo(`Successfully bulk-inserted ${inserts.length} messages`);
@@ -115,7 +115,7 @@ async function flushToDatabase() {
       if (deletes.length > 0) {
         const placeholders = deletes.map(() => '?').join(', ');
         await connection.execute(
-          `DELETE FROM dpp_pbj.rpp_pokja_chat WHERE uuid IN (${placeholders})`,
+          `DELETE FROM rpp_pokja_chat WHERE uuid IN (${placeholders})`,
           deletes
         );
         logInfo(`Successfully bulk-deleted ${deletes.length} messages`);
@@ -127,25 +127,25 @@ async function flushToDatabase() {
           const { rppId, userId, context, time } = read;
 
           const [existing] = await connection.execute(
-            'SELECT id FROM dpp_pbj.rpp_pokja_chat_read_status WHERE rpp_id = ? AND user_id = ? AND context = ?',
+            'SELECT id FROM rpp_pokja_chat_read_status WHERE rpp_id = ? AND user_id = ? AND context = ?',
             [rppId, userId, context]
           );
 
           if (existing.length > 0) {
             await connection.execute(
-              'UPDATE dpp_pbj.rpp_pokja_chat_read_status SET last_read_at = ? WHERE id = ?',
+              'UPDATE rpp_pokja_chat_read_status SET last_read_at = ? WHERE id = ?',
               [time, existing[0].id]
             );
           } else {
             const uuid = uuidv4();
             await connection.execute(
-              'INSERT INTO dpp_pbj.rpp_pokja_chat_read_status (uuid, rpp_id, user_id, context, last_read_at) VALUES (?, ?, ?, ?, ?)',
+              'INSERT INTO rpp_pokja_chat_read_status (uuid, rpp_id, user_id, context, last_read_at) VALUES (?, ?, ?, ?, ?)',
               [uuid, rppId, userId, context, time]
             );
           }
 
           const [messages] = await connection.execute(
-            'SELECT id, read_by FROM dpp_pbj.rpp_pokja_chat WHERE rpp_id = ? AND context = ? AND user_id != ? AND created_at <= ?',
+            'SELECT id, read_by FROM rpp_pokja_chat WHERE rpp_id = ? AND context = ? AND user_id != ? AND created_at <= ?',
             [rppId, context, userId, time]
           );
 
@@ -161,7 +161,7 @@ async function flushToDatabase() {
             if (!readByList.includes(userId)) {
               readByList.push(userId);
               await connection.execute(
-                'UPDATE dpp_pbj.rpp_pokja_chat SET read_by = ? WHERE id = ?',
+                'UPDATE rpp_pokja_chat SET read_by = ? WHERE id = ?',
                 [JSON.stringify(readByList), msg.id]
               );
             }
