@@ -67,7 +67,7 @@ async function flushToDatabase() {
     const jobs = accumulatedJobs;
     accumulatedJobs = [];
 
-    console.log(`>>> [dppChatPersistenceWorker] Retrieved ${jobs.length} jobs from queue`);
+
 
     const inserts = [];
     const deletes = [];
@@ -91,7 +91,7 @@ async function flushToDatabase() {
 
     const readList = Array.from(reads.values());
 
-    console.log(`>>> [dppChatPersistenceWorker] Processing: ${inserts.length} inserts, ${deletes.length} deletes, ${readList.length} read updates`);
+    console.log(`>>> [dppChatPersistenceWorker] Flushing: ${inserts.length} inserts, ${deletes.length} deletes, ${readList.length} read updates`);
     logInfo(`Flushing batched database sync: ${inserts.length} inserts, ${deletes.length} deletes, ${readList.length} read updates`);
 
     const connection = await pool.getConnection();
@@ -117,30 +117,25 @@ async function flushToDatabase() {
           );
         }
 
-        console.log(`>>> [dppChatPersistenceWorker] Executing query: INSERT IGNORE INTO rpp_pokja_chat ... with ${inserts.length} rows`);
         await connection.execute(
           `INSERT IGNORE INTO rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at) VALUES ${placeholders}`,
           params
         );
-        console.log(`>>> [dppChatPersistenceWorker] Successfully inserted ${inserts.length} messages`);
         logInfo(`Successfully bulk-inserted ${inserts.length} messages`);
       }
 
       // 2. Process batch deletes
       if (deletes.length > 0) {
         const placeholders = deletes.map(() => '?').join(', ');
-        console.log(`>>> [dppChatPersistenceWorker] Executing delete for ${deletes.length} messages`);
         await connection.execute(
           `DELETE FROM rpp_pokja_chat WHERE uuid IN (${placeholders})`,
           deletes
         );
-        console.log(`>>> [dppChatPersistenceWorker] Successfully deleted ${deletes.length} messages`);
         logInfo(`Successfully bulk-deleted ${deletes.length} messages`);
       }
 
       // 3. Process read status updates
       if (readList.length > 0) {
-        console.log(`>>> [dppChatPersistenceWorker] Processing ${readList.length} read status updates`);
         for (const read of readList) {
           const { rppId, userId, context, time } = read;
 
@@ -185,12 +180,11 @@ async function flushToDatabase() {
             }
           }
         }
-        console.log(`>>> [dppChatPersistenceWorker] Successfully updated read statuses`);
         logInfo(`Successfully updated read status for ${readList.length} users`);
       }
 
       await connection.commit();
-      console.log('>>> [dppChatPersistenceWorker] Transaction committed successfully');
+      console.log(`>>> [dppChatPersistenceWorker] Sync complete (${inserts.length} inserts, ${deletes.length} deletes, ${readList.length} read updates)`);
     } catch (err) {
       await connection.rollback();
       console.error('>>> [dppChatPersistenceWorker] Database transaction failed:', err);
@@ -221,7 +215,6 @@ async function flushToDatabase() {
 }
 
 async function startWorkerLoop() {
-  console.log('>>> [dppChatPersistenceWorker] Starting Redis blocking worker loop...');
   while (!stopping) {
     try {
       const result = await redis.blpop('dpp_chat_persistence_queue', 5);
@@ -234,7 +227,6 @@ async function startWorkerLoop() {
         }
 
         if (!timerId) {
-          console.log('>>> [dppChatPersistenceWorker] Data arrived. Scheduling flush in 10 seconds.');
           timerId = setTimeout(async () => {
             timerId = null;
             await flushToDatabase();
@@ -267,7 +259,6 @@ function startDppChatPersistence() {
         timerId = null;
       }
       try {
-        console.log('>>> [dppChatPersistenceWorker] Worker stopping: executing final database flush...');
         await flushToDatabase();
       } catch (_) {}
       try { await redis.quit(); } catch (_) {}
