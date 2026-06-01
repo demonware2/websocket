@@ -105,7 +105,7 @@ async function flushToDatabase() {
         }
 
         await connection.execute(
-          `INSERT INTO dpp_pbj.rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at) VALUES ${placeholders}`,
+          `INSERT IGNORE INTO dpp_pbj.rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at) VALUES ${placeholders}`,
           params
         );
         logInfo(`Successfully bulk-inserted ${inserts.length} messages`);
@@ -173,10 +173,19 @@ async function flushToDatabase() {
       await connection.commit();
     } catch (err) {
       await connection.rollback();
-      logError('Database transaction failed, returning jobs to Redis queue', { error: err.message });
+      logError('Database transaction failed, processing retries for jobs', { error: err.message });
 
       for (let i = jobs.length - 1; i >= 0; i--) {
-        await redis.lpush('dpp_chat_persistence_queue', JSON.stringify(jobs[i]));
+        const job = jobs[i];
+        job.retries = (job.retries || 0) + 1;
+        if (job.retries > 3) {
+          job.error = err.message;
+          job.failed_at = new Date().toISOString();
+          await redis.rpush('dpp_chat_failed_jobs', JSON.stringify(job));
+          logError(`Job reached max retries, moved to failed queue: ${job.action}`, { uuid: job.data?.uuid || job.uuid, error: err.message });
+        } else {
+          await redis.lpush('dpp_chat_persistence_queue', JSON.stringify(job));
+        }
       }
     } finally {
       connection.release();
