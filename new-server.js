@@ -37,6 +37,8 @@ const redis = new Redis({
 
 const connections = new Map();
 const callCenterPersistence = startCallCenterPersistence();
+const { startDppChatPersistence } = require('./worker/dppChatPersistenceWorker');
+const dppChatPersistence = startDppChatPersistence();
 
 const kajianPresenceRooms = new Map();
 const penetapanPresenceRooms = new Map();
@@ -1045,6 +1047,12 @@ function gracefulShutdown() {
     try {
         if (callCenterPersistence && typeof callCenterPersistence.stop === 'function') {
             callCenterPersistence.stop();
+        }
+
+        if (dppChatPersistence && typeof dppChatPersistence.stop === 'function') {
+            try {
+                dppChatPersistence.stop();
+            } catch (_) {}
         }
 
         server.close(() => {

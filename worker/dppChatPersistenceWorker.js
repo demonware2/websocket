@@ -28,6 +28,14 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
+redis.on('error', (err) => {
+  console.error('>>> [dppChatPersistenceWorker] Redis client error:', err);
+});
+
+pool.on('error', (err) => {
+  console.error('>>> [dppChatPersistenceWorker] Database pool error:', err);
+});
+
 let stopping = false;
 let flushing = false;
 let flushInterval = null;
