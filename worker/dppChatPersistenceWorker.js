@@ -38,22 +38,20 @@ pool.on('error', (err) => {
 
 let stopping = false;
 let flushing = false;
-let flushInterval = null;
+let timerId = null;
+let accumulatedJobs = [];
 
 async function flushToDatabase() {
   if (flushing) return;
   flushing = true;
 
   try {
-    const jobs = [];
-    let jobData;
-    let count = 0;
-
+    let count = accumulatedJobs.length;
     while (count < 100) {
-      jobData = await redis.lpop('dpp_chat_persistence_queue');
+      const jobData = await redis.lpop('dpp_chat_persistence_queue');
       if (!jobData) break;
       try {
-        jobs.push(JSON.parse(jobData));
+        accumulatedJobs.push(JSON.parse(jobData));
       } catch (e) {
         console.error('>>> [dppChatPersistenceWorker] Failed to parse job JSON:', e.message, jobData);
         logError('Failed to parse queue job, skipping invalid JSON', { data: jobData });
@@ -61,10 +59,13 @@ async function flushToDatabase() {
       count++;
     }
 
-    if (jobs.length === 0) {
+    if (accumulatedJobs.length === 0) {
       flushing = false;
       return;
     }
+
+    const jobs = accumulatedJobs;
+    accumulatedJobs = [];
 
     console.log(`>>> [dppChatPersistenceWorker] Retrieved ${jobs.length} jobs from queue`);
 
@@ -219,26 +220,54 @@ async function flushToDatabase() {
   flushing = false;
 }
 
+async function startWorkerLoop() {
+  console.log('>>> [dppChatPersistenceWorker] Starting Redis blocking worker loop...');
+  while (!stopping) {
+    try {
+      const result = await redis.blpop('dpp_chat_persistence_queue', 5);
+      if (result && !stopping) {
+        const jobData = result[1];
+        try {
+          accumulatedJobs.push(JSON.parse(jobData));
+        } catch (e) {
+          console.error('>>> [dppChatPersistenceWorker] Failed to parse job JSON:', e.message, jobData);
+        }
+
+        if (!timerId) {
+          console.log('>>> [dppChatPersistenceWorker] Data arrived. Scheduling flush in 10 seconds.');
+          timerId = setTimeout(async () => {
+            timerId = null;
+            await flushToDatabase();
+          }, 10000);
+        }
+      }
+    } catch (err) {
+      if (!stopping) {
+        console.error('>>> [dppChatPersistenceWorker] Error in worker loop:', err);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+  }
+}
+
 function startDppChatPersistence() {
   stopping = false;
 
-  flushInterval = setInterval(async () => {
-    if (!stopping) {
-      await flushToDatabase();
-    }
-  }, 10000); // Trigger flush every 10 seconds
+  startWorkerLoop().catch((err) => {
+    console.error('>>> [dppChatPersistenceWorker] Critical loop error:', err);
+  });
 
   logInfo('DPP chat persistence worker started (Redis-side buffering mode)');
 
   return {
     stop: async () => {
       stopping = true;
-      if (flushInterval) {
-        clearInterval(flushInterval);
-        flushInterval = null;
+      if (timerId) {
+        clearTimeout(timerId);
+        timerId = null;
       }
       try {
-        logInfo('Worker stopping: executing final database flush...');
+        console.log('>>> [dppChatPersistenceWorker] Worker stopping: executing final database flush...');
         await flushToDatabase();
       } catch (_) {}
       try { await redis.quit(); } catch (_) {}
