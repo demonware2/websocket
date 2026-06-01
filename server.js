@@ -11,16 +11,16 @@ const { handleRequestHttp } = require('./requestServer');
 const PORT = parseInt(process.env.PORT) || 9950;
 
 const server = http.createServer();
-// Harden WS server: limit payloads and disable compression to reduce memory/CPU spikes
 const wss = new WebSocket.Server({
     noServer: true,
-    // Allow larger frames to support editor payloads (default 5MB)
     maxPayload: parseInt(process.env.WS_MAX_PAYLOAD || String(5 * 1024 * 1024), 10),
     perMessageDeflate: false
 });
 
 setupWebSocketServer(wss);
 const callCenterPersistence = startCallCenterPersistence();
+const { startDppChatPersistence } = require('./worker/dppChatPersistenceWorker');
+const dppChatPersistence = startDppChatPersistence();
 
 server.on('upgrade', async function upgrade(request, socket, head) {
     logDebug(`WebSocket upgrade request from ${socket.remoteAddress} to ${request.url}`);
@@ -31,7 +31,6 @@ server.on('upgrade', async function upgrade(request, socket, head) {
         const result = await verifyAuthentication(request, pathname, 'ws', socket);
         if (!result) {
             logWarning('Authentication failed', { pathname });
-            // Just close the socket, don't throw error
             if (socket && !socket.destroyed) {
                 socket.destroy();
             }
@@ -76,14 +75,11 @@ server.on('request', (req, res) => {
     });
 });
 
-// Remove early error handler setup - will be done after server starts
-
 logInfo(`Attempting to listen on port ${PORT}...`);
 server.listen(PORT, '0.0.0.0', () => {
     logInfo(`Successfully listening on 0.0.0.0:${PORT}`);
     logInfo(`WebSocket server running on 0.0.0.0:${PORT}`);
-    
-    // Set up error handlers after server starts
+
     setupErrorHandlers(server, wss);
     
 }).on('error', (err) => {
@@ -91,7 +87,6 @@ server.listen(PORT, '0.0.0.0', () => {
     process.exit(1);
 });
 
-// Conservative HTTP timeouts to avoid hanging resources
 try {
     server.requestTimeout = parseInt(process.env.HTTP_REQUEST_TIMEOUT || '60000', 10); // 60s
     server.headersTimeout = parseInt(process.env.HTTP_HEADERS_TIMEOUT || '65000', 10); // 65s
@@ -100,13 +95,13 @@ try {
     // Ignore if not supported on this Node version
 }
 
-// Ensure module-level cleanup hooks can run on shutdown
 try {
     const editorHandler = require('./app/Function/editorHandler');
     ['SIGINT', 'SIGTERM', 'SIGQUIT'].forEach(sig => {
         process.on(sig, () => {
             try { editorHandler.cleanup(); } catch (_) {}
             try { callCenterPersistence.stop(); } catch (_) {}
+            try { dppChatPersistence.stop(); } catch (_) {}
         });
     });
 } catch (_) {
