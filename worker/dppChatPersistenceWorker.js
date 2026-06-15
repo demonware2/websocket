@@ -100,7 +100,7 @@ async function flushToDatabase() {
 
       // 1. Process batch inserts
       if (inserts.length > 0) {
-        const placeholders = inserts.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+        const placeholders = inserts.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
         const params = [];
         for (const msg of inserts) {
           params.push(
@@ -113,12 +113,15 @@ async function flushToDatabase() {
             msg.attachment_type || null,
             typeof msg.read_by === 'object' ? JSON.stringify(msg.read_by) : (msg.read_by || '[]'),
             msg.context,
-            msg.created_at
+            msg.created_at,
+            msg.room || 'pokja',
+            msg.session_uuid || null,
+            msg.sender_type || 'pokja'
           );
         }
 
         await connection.execute(
-          `INSERT IGNORE INTO rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at) VALUES ${placeholders}`,
+          `INSERT IGNORE INTO rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at, room, session_uuid, sender_type) VALUES ${placeholders}`,
           params
         );
         logInfo(`Successfully bulk-inserted ${inserts.length} messages`);
