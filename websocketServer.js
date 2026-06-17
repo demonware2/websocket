@@ -115,6 +115,15 @@ function broadcastPresence(store, rppId, payload, excludeWs = null) {
     }
     room.clients.forEach((clientWs) => {
         if (clientWs !== excludeWs) {
+            // Leak prevention: Do not broadcast internal pokja chats to guest/external users
+            if (payload && payload.type === 'presence:consensus_chat' && payload.chat && payload.chat.room === 'pokja') {
+                const clientState = clientWs['_kajianPresence'] || clientWs['_penetapanPresence'] || {};
+                const isClientGuest = (clientState.username && clientState.username.startsWith('guest_')) || 
+                                      (clientState.userId && String(clientState.userId).startsWith('guest_'));
+                if (isClientGuest) {
+                    return; // Skip sending to guest
+                }
+            }
             presenceSafeSend(clientWs, payload);
         }
     });
@@ -294,6 +303,8 @@ function handlePresenceChannel({
         rppId,
         userId,
         userName,
+        username: user.username || '',
+        roles: user.roles || [],
         connectionId,
         removed: false,
         connectedAt: Date.now(),
@@ -353,11 +364,11 @@ function handlePresenceChannel({
                     currentRoom.users.set(state.userId, currentInfo);
                 }
             } else if (payload.type === 'presence:consensus_chat_send') {
-                const { session_uuid, message, room } = payload;
+                const { session_uuid, message, room, metadata } = payload;
                 if (!session_uuid || !message) return;
 
                 const chatUuid = uuidv4();
-                const senderType = (state.userName && state.userName.toLowerCase().includes('guest')) || (state.userId && String(state.userId).startsWith('guest_')) ? 'external' : 'pokja';
+                const senderType = (state.username && state.username.startsWith('guest_')) || (state.userName && state.userName.toLowerCase().includes('guest')) || (state.userId && String(state.userId).startsWith('guest_')) ? 'external' : 'pokja';
                 let senderName = state.userName || 'Pokja Member';
                 if (senderType === 'external' && !senderName.includes('(Eksternal)')) {
                     senderName += ' (Eksternal)';
@@ -378,7 +389,8 @@ function handlePresenceChannel({
                     created_at: createdAt,
                     room: room || 'pokja',
                     session_uuid: session_uuid,
-                    sender_type: senderType
+                    sender_type: senderType,
+                    metadata: metadata || null
                 };
 
                 const queuePayload = {
@@ -388,6 +400,34 @@ function handlePresenceChannel({
 
                 try {
                     redis.rpush('dpp_chat_persistence_queue', JSON.stringify(queuePayload));
+
+                    const cacheKey = `dpp_chat:${state.rppId}:consensus`;
+                    redis.get(cacheKey).then((cachedData) => {
+                        let cachedMessages = [];
+                        if (cachedData) {
+                            try {
+                                cachedMessages = JSON.parse(cachedData);
+                                if (!Array.isArray(cachedMessages)) cachedMessages = [];
+                            } catch (_) {
+                                cachedMessages = [];
+                            }
+                        }
+                        
+                        const seqKey = `dpp_chat:id_seq:${state.rppId}:consensus`;
+                        redis.incr(seqKey).then((seqId) => {
+                            const cachedMsg = {
+                                ...chatData,
+                                read_by: [state.userId],
+                                id: seqId
+                            };
+                            cachedMessages.push(cachedMsg);
+                            redis.setex(cacheKey, 604800, JSON.stringify(cachedMessages));
+                        }).catch((err) => {
+                            logError('Error incrementing chat seq in consensus cache update', { error: err.message });
+                        });
+                    }).catch((err) => {
+                        logError('Error reading consensus chat cache for update', { error: err.message });
+                    });
 
                     broadcastFn(state.rppId, {
                         type: 'presence:consensus_chat',
@@ -399,7 +439,8 @@ function handlePresenceChannel({
                             sender_type: senderType,
                             message: message,
                             room: room || 'pokja',
-                            create_date: createdAt
+                            create_date: createdAt,
+                            metadata: metadata || null
                         }
                     }, null);
                 } catch (e) {
@@ -412,7 +453,7 @@ function handlePresenceChannel({
                 } catch (e) {
                     return;
                 }
-                const { context, message } = wsPayload;
+                const { context, message, metadata } = wsPayload;
                 if (!context || !message) return;
 
                 const chatUuid = uuidv4();
@@ -428,7 +469,8 @@ function handlePresenceChannel({
                     attachment_type: null,
                     read_by: [state.userId],
                     context: context,
-                    created_at: createdAt
+                    created_at: createdAt,
+                    metadata: metadata || null
                 };
 
                 const queuePayload = {
@@ -488,10 +530,6 @@ function handlePresenceChannel({
 
                 const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
-                const readStatusCacheKey = `dpp_chat_read_status:${state.rppId}:${context}`;
-                redis.hset(readStatusCacheKey, state.userId, now);
-                redis.expire(readStatusCacheKey, 604800);
-
                 const chatCacheKey = `dpp_chat:${state.rppId}:${context}`;
                 redis.get(chatCacheKey).then((cachedData) => {
                     if (cachedData) {
@@ -501,43 +539,54 @@ function handlePresenceChannel({
                                 let changed = false;
                                 for (const msg of cachedMessages) {
                                     if (msg.user_id !== state.userId) {
-                                        if (!msg.read_by) msg.read_by = [];
-                                        if (!msg.read_by.includes(state.userId)) {
-                                            msg.read_by.push(state.userId);
+                                        let readByArray = [];
+                                        if (msg.read_by) {
+                                            try {
+                                                readByArray = typeof msg.read_by === 'string' ? JSON.parse(msg.read_by) : msg.read_by;
+                                                if (!Array.isArray(readByArray)) readByArray = [];
+                                            } catch (_) {
+                                                readByArray = [];
+                                            }
+                                        }
+                                        if (!readByArray.includes(state.userId)) {
+                                            readByArray.push(state.userId);
+                                            msg.read_by = readByArray;
                                             changed = true;
+                                        } else {
+                                            msg.read_by = readByArray;
                                         }
                                     }
                                 }
                                 if (changed) {
                                     redis.setex(chatCacheKey, 604800, JSON.stringify(cachedMessages));
+
+                                    const queuePayload = {
+                                        action: 'update_read',
+                                        rpp_id: state.rppId,
+                                        user_id: state.userId,
+                                        context: context,
+                                        time: now
+                                    };
+                                    try {
+                                        redis.rpush('dpp_chat_persistence_queue', JSON.stringify(queuePayload));
+
+                                        broadcastFn(state.rppId, {
+                                            type: 'presence:chat_read',
+                                            target: JSON.stringify({
+                                                rpp_id: state.rppId,
+                                                user_id: state.userId,
+                                                context: context,
+                                                last_read_at: now
+                                            })
+                                        }, null);
+                                    } catch (e) {
+                                        logError('Error processing dpp_chat_read via websocket', { error: e.message });
+                                    }
                                 }
                             }
                         } catch (_) {}
                     }
                 }).catch(() => {});
-
-                const queuePayload = {
-                    action: 'update_read',
-                    rpp_id: state.rppId,
-                    user_id: state.userId,
-                    context: context,
-                    time: now
-                };
-                try {
-                    redis.rpush('dpp_chat_persistence_queue', JSON.stringify(queuePayload));
-
-                    broadcastFn(state.rppId, {
-                        type: 'presence:chat_read',
-                        target: JSON.stringify({
-                            rpp_id: state.rppId,
-                            user_id: state.userId,
-                            context: context,
-                            last_read_at: now
-                        })
-                    }, null);
-                } catch (e) {
-                    logError('Error processing dpp_chat_read via websocket', { error: e.message });
-                }
             } else if (payload.type.startsWith('presence:')) {
                 broadcastFn(state.rppId, {
                     ...payload,

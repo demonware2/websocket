@@ -100,7 +100,7 @@ async function flushToDatabase() {
 
       // 1. Process batch inserts
       if (inserts.length > 0) {
-        const placeholders = inserts.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+        const placeholders = inserts.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
         const params = [];
         for (const msg of inserts) {
           params.push(
@@ -116,12 +116,13 @@ async function flushToDatabase() {
             msg.created_at,
             msg.room || 'pokja',
             msg.session_uuid || null,
-            msg.sender_type || 'pokja'
+            msg.sender_type || 'pokja',
+            typeof msg.metadata === 'object' && msg.metadata !== null ? JSON.stringify(msg.metadata) : (msg.metadata || null)
           );
         }
 
         await connection.execute(
-          `INSERT IGNORE INTO rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at, room, session_uuid, sender_type) VALUES ${placeholders}`,
+          `INSERT IGNORE INTO rpp_pokja_chat (uuid, rpp_id, user_id, user_name, message, attachment_path, attachment_type, read_by, context, created_at, room, session_uuid, sender_type, metadata) VALUES ${placeholders}`,
           params
         );
         logInfo(`Successfully bulk-inserted ${inserts.length} messages`);
@@ -141,24 +142,6 @@ async function flushToDatabase() {
       if (readList.length > 0) {
         for (const read of readList) {
           const { rppId, userId, context, time } = read;
-
-          const [existing] = await connection.execute(
-            'SELECT id FROM rpp_pokja_chat_read_status WHERE rpp_id = ? AND user_id = ? AND context = ?',
-            [rppId, userId, context]
-          );
-
-          if (existing.length > 0) {
-            await connection.execute(
-              'UPDATE rpp_pokja_chat_read_status SET last_read_at = ? WHERE id = ?',
-              [time, existing[0].id]
-            );
-          } else {
-            const uuid = uuidv4();
-            await connection.execute(
-              'INSERT INTO rpp_pokja_chat_read_status (uuid, rpp_id, user_id, context, last_read_at) VALUES (?, ?, ?, ?, ?)',
-              [uuid, rppId, userId, context, time]
-            );
-          }
 
           const [messages] = await connection.execute(
             'SELECT id, read_by FROM rpp_pokja_chat WHERE rpp_id = ? AND context = ? AND user_id != ? AND created_at <= ?',
