@@ -1,6 +1,6 @@
 const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { handleWhatsapp } = require('./app/Function/whatsappHandler');
-const { getAllDataPM2, getLogsPM2 } = require('./app/Function/pm2DataHandler');
+const { getAllDataPM2, getLogsPM2, startProcessPM2, stopProcessPM2, restartProcessPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
 const { handleCallCenter, handleCallCenterAdminBroadcast } = require('./app/Function/callCenterHandler');
 const editorHandler = require('./app/Function/editorHandler');
@@ -871,12 +871,54 @@ function gatherPM2Data(ws, user, request) {
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
-            if (data.type === 'requestLogs' && data.pm_id) {
+            if (data.type === 'requestLogs' && data.pm_id !== undefined) {
                 await sendLogs(data.pm_id);
+            } else if (data.type === 'pm2_action' && data.action && data.processId !== undefined) {
+                const { action, processId, processName } = data;
+                const targetName = (processName || String(processId)).toLowerCase();
+
+                if (action === 'stop' && (targetName.includes('websocket'))) {
+                    safeSend(ws, {
+                        type: 'pm2_action_result',
+                        success: false,
+                        message: 'Protection Guard: The websocket monitoring process cannot be stopped.'
+                    });
+                    return;
+                }
+
+                let result;
+                if (action === 'start') {
+                    result = await startProcessPM2(processId);
+                } else if (action === 'stop') {
+                    result = await stopProcessPM2(processId);
+                } else if (action === 'restart') {
+                    result = await restartProcessPM2(processId);
+                } else {
+                    safeSend(ws, {
+                        type: 'pm2_action_result',
+                        success: false,
+                        message: 'Invalid action. Only start, stop, and restart are allowed.'
+                    });
+                    return;
+                }
+
+                safeSend(ws, {
+                    type: 'pm2_action_result',
+                    success: true,
+                    action,
+                    processId,
+                    message: `Process ${processId} ${action}ed successfully.`
+                });
+
+                setTimeout(sendPM2Data, 800);
             }
         } catch (error) {
             logError('PM2 message error', { error: error.message });
-            // Don't throw - just log the error
+            safeSend(ws, {
+                type: 'pm2_action_result',
+                success: false,
+                message: error.message || 'PM2 Action Failed'
+            });
         }
     });
 

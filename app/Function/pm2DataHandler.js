@@ -231,7 +231,64 @@ async function getAllDataPM2() {
   }
 }
 
+function startProcessPM2(pm_id) {
+  return new Promise((resolve, reject) => {
+    connectToPM2()
+      .then(() => {
+        pm2.start(pm_id, (err, proc) => {
+          pm2.disconnect();
+          if (err) {
+            logError(`Failed to start process ${pm_id}:`, err);
+            reject(err);
+          } else {
+            resolve(proc);
+          }
+        });
+      })
+      .catch(reject);
+  });
+}
+
+function stopProcessPM2(pm_id) {
+  return new Promise((resolve, reject) => {
+    connectToPM2()
+      .then(() => {
+        pm2.stop(pm_id, (err, proc) => {
+          pm2.disconnect();
+          if (err) {
+            logError(`Failed to stop process ${pm_id}:`, err);
+            reject(err);
+          } else {
+            resolve(proc);
+          }
+        });
+      })
+      .catch(reject);
+  });
+}
+
+function restartProcessPM2(pm_id) {
+  return new Promise((resolve, reject) => {
+    connectToPM2()
+      .then(() => {
+        pm2.restart(pm_id, (err, proc) => {
+          pm2.disconnect();
+          if (err) {
+            logError(`Failed to restart process ${pm_id}:`, err);
+            reject(err);
+          } else {
+            resolve(proc);
+          }
+        });
+      })
+      .catch(reject);
+  });
+}
+
 module.exports = {
   getAllDataPM2,
-  getLogsPM2
+  getLogsPM2,
+  startProcessPM2,
+  stopProcessPM2,
+  restartProcessPM2
 };
