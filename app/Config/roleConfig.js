@@ -7,6 +7,7 @@ module.exports = {
         '/api/dashboard': [1, 2, 3, 4],
         '/handleSystemInfo': [1, 2, 3, 4],
         '/gatherPM2Data': [1, 2, 3, 4],
+        '/handleNetdata': [1, 2, 3, 4],
         '/handleChat': [1, 2, 3, 4], // Added new route for chat
         '/call-center/admin/broadcast': [1, 64, 65, 66, 67, 68],
         '/kajian-presence': [7],

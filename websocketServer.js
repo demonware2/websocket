@@ -736,6 +736,9 @@ function setupWebSocketServer(webSocketServer) {
                 case '/handleSystemInfo':
                     handleSystemInfo(ws, user, request);
                     break;
+                case '/handleNetdata':
+                    handleNetdata(ws, user, request);
+                    break;
                 case '/handleWhatsapp':
                     handleWhatsapp(ws, request);
                     break;
@@ -904,6 +907,38 @@ function handleSystemInfo(ws, user, request) {
     ws.on('close', () => {
         clearInterval(intervalId);
         logInfo(`Connection closed for user ${user.userId}`);
+    });
+}
+
+function handleNetdata(ws, user, request) {
+    const http = require('http');
+    let intervalId;
+
+    const sendNetdataMetrics = () => {
+        http.get('http://127.0.0.1:19999/api/v1/allmetrics?format=json', (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => {
+                try {
+                    if (ws && ws.readyState === 1) {
+                        const json = JSON.parse(body);
+                        ws.send(JSON.stringify({ type: 'netdata_metrics', data: json }));
+                    }
+                } catch (e) {
+                    // Ignore parse errors
+                }
+            });
+        }).on('error', (err) => {
+            logWarning('Netdata local fetch error', { message: err.message });
+        });
+    };
+
+    sendNetdataMetrics();
+    intervalId = setInterval(sendNetdataMetrics, 2000);
+
+    ws.on('close', () => {
+        if (intervalId) clearInterval(intervalId);
+        logInfo(`Netdata WS connection closed for user ${user ? user.userId : 'guest'}`);
     });
 }
 
