@@ -24,11 +24,11 @@ function updateKioskHeartbeat(token) {
         const md5Prefixed = crypto.createHash('md5').update(prefixedToken).digest('hex');
         const val = new Date().toISOString().replace('T', ' ').substring(0, 19);
 
-        redisPublisher.setex(`kiosk:heartbeat:${md5Raw}`, 150, val).catch(() => {});
-        redisPublisher.setex(`kiosk:heartbeat:${md5Clean}`, 150, val).catch(() => {});
-        redisPublisher.setex(`kiosk:heartbeat:${md5Prefixed}`, 150, val).catch(() => {});
-        redisPublisher.setex(`kiosk_heartbeat_${md5Raw}`, 150, val).catch(() => {});
-        redisPublisher.setex(`kiosk_heartbeat_${md5Clean}`, 150, val).catch(() => {});
+        redisPublisher.setex(`kiosk:heartbeat:${md5Raw}`, 150, val).catch(() => { });
+        redisPublisher.setex(`kiosk:heartbeat:${md5Clean}`, 150, val).catch(() => { });
+        redisPublisher.setex(`kiosk:heartbeat:${md5Prefixed}`, 150, val).catch(() => { });
+        redisPublisher.setex(`kiosk_heartbeat_${md5Raw}`, 150, val).catch(() => { });
+        redisPublisher.setex(`kiosk_heartbeat_${md5Clean}`, 150, val).catch(() => { });
     } catch (e) {
         logWarning('[Kiosk WS] Heartbeat update error', { error: e.message });
     }
@@ -45,11 +45,11 @@ function removeKioskHeartbeat(token) {
         const md5Clean = crypto.createHash('md5').update(cleanToken).digest('hex');
         const md5Prefixed = crypto.createHash('md5').update(prefixedToken).digest('hex');
 
-        redisPublisher.del(`kiosk:heartbeat:${md5Raw}`).catch(() => {});
-        redisPublisher.del(`kiosk:heartbeat:${md5Clean}`).catch(() => {});
-        redisPublisher.del(`kiosk:heartbeat:${md5Prefixed}`).catch(() => {});
-        redisPublisher.del(`kiosk_heartbeat_${md5Raw}`).catch(() => {});
-        redisPublisher.del(`kiosk_heartbeat_${md5Clean}`).catch(() => {});
+        redisPublisher.del(`kiosk:heartbeat:${md5Raw}`).catch(() => { });
+        redisPublisher.del(`kiosk:heartbeat:${md5Clean}`).catch(() => { });
+        redisPublisher.del(`kiosk:heartbeat:${md5Prefixed}`).catch(() => { });
+        redisPublisher.del(`kiosk_heartbeat_${md5Raw}`).catch(() => { });
+        redisPublisher.del(`kiosk_heartbeat_${md5Clean}`).catch(() => { });
     } catch (e) {
         logWarning('[Kiosk WS] Heartbeat remove error', { error: e.message });
     }
@@ -72,7 +72,7 @@ function broadcastKioskStatusChange(token, isOnline) {
                 }
             });
         });
-    } catch (_) {}
+    } catch (_) { }
 }
 
 const statusDebounceTimers = new Map();
@@ -151,7 +151,7 @@ function handleKiosk(ws, user, request) {
 
     if (!kioskToken) {
         logWarning('[Kiosk WS] Connection rejected: Missing kioskToken parameter');
-        try { ws.close(4001, 'Missing kioskToken'); } catch (_) {}
+        try { ws.close(4001, 'Missing kioskToken'); } catch (_) { }
         return;
     }
 
@@ -163,7 +163,6 @@ function handleKiosk(ws, user, request) {
     const isAdmin = String(kioskToken).startsWith('admin_');
     if (!isAdmin) {
         updateKioskHeartbeat(kioskToken);
-        debouncedBroadcastStatus(kioskToken, true);
     }
 
     logInfo(`[Kiosk WS] Client TV display connected for token: ${kioskToken}`);
@@ -185,7 +184,7 @@ function handleKiosk(ws, user, request) {
                 if (!isAdmin) updateKioskHeartbeat(kioskToken);
                 const cleanTok = String(data.kiosk_token || kioskToken).replace(/^kiosk_|^ksk_/, '');
                 kioskStates.set(cleanTok, data);
-                redisPublisher.setex('kiosk:state:' + cleanTok, 86400, JSON.stringify(data)).catch(() => {});
+                redisPublisher.setex('kiosk:state:' + cleanTok, 86400, JSON.stringify(data)).catch(() => { });
 
                 kioskClients.forEach((clientSet) => {
                     clientSet.forEach(clientWs => {
@@ -202,12 +201,12 @@ function handleKiosk(ws, user, request) {
                 } else {
                     redisPublisher.get('kiosk:state:' + reqTok).then(val => {
                         if (val) {
-                            try { ws.send(val); } catch (_) {}
+                            try { ws.send(val); } catch (_) { }
                         }
-                    }).catch(() => {});
+                    }).catch(() => { });
                 }
             }
-        } catch (_) {}
+        } catch (_) { }
     });
 
     ws.on('close', () => {
@@ -218,7 +217,6 @@ function handleKiosk(ws, user, request) {
                 kioskClients.delete(kioskToken);
                 if (!isAdmin) {
                     removeKioskHeartbeat(kioskToken);
-                    debouncedBroadcastStatus(kioskToken, false);
                 }
             }
         }
