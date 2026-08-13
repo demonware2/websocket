@@ -3,6 +3,7 @@ const { handleWhatsapp } = require('./app/Function/whatsappHandler');
 const { getAllDataPM2, getLogsPM2, startProcessPM2, stopProcessPM2, restartProcessPM2 } = require('./app/Function/pm2DataHandler');
 const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
 const { handleCallCenter, handleCallCenterAdminBroadcast } = require('./app/Function/callCenterHandler');
+const { handleKiosk } = require('./app/Function/kioskHandler');
 const editorHandler = require('./app/Function/editorHandler');
 const { removeConnection, normalizeRequestedPath } = require('./app/Helper/authMiddleware');
 const { logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
@@ -753,6 +754,9 @@ function setupWebSocketServer(webSocketServer) {
                     break;
                 case '/call-center/admin/broadcast':
                     handleCallCenterAdminBroadcast(ws, user, request);
+                    break;
+                case '/kiosk':
+                    handleKiosk(ws, user, request);
                     break;
                 default:
                     if (cleanRequestedPath === '/kajian-presence' || cleanRequestedPath.startsWith('/kajian-presence/')) {

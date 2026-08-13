@@ -17,7 +17,8 @@ module.exports = {
         '/editor': [1, 2, 3, 4], // Editor route for all authenticated users
     },
     publicRoutes: [
-        '/call-center/chat'
+        '/call-center/chat',
+        '/kiosk'
         // Define websocket paths that should skip role enforcement entirely.
         // Supports exact paths (`/call-center/public`) or prefix matches using a trailing wildcard (`/widget/public/*`).
     ],
