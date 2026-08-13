@@ -75,6 +75,19 @@ function broadcastKioskStatusChange(token, isOnline) {
     } catch (_) {}
 }
 
+const statusDebounceTimers = new Map();
+
+function debouncedBroadcastStatus(token, isOnline) {
+    if (!token) return;
+    if (statusDebounceTimers.has(token)) {
+        clearTimeout(statusDebounceTimers.get(token));
+    }
+    statusDebounceTimers.set(token, setTimeout(() => {
+        statusDebounceTimers.delete(token);
+        broadcastKioskStatusChange(token, isOnline);
+    }, 5000));
+}
+
 subscriber.subscribe('kiosk:events', (err, count) => {
     if (err) {
         logError('[Kiosk WS] Redis subscribe error', { error: err.message });
@@ -150,7 +163,7 @@ function handleKiosk(ws, user, request) {
     const isAdmin = String(kioskToken).startsWith('admin_');
     if (!isAdmin) {
         updateKioskHeartbeat(kioskToken);
-        broadcastKioskStatusChange(kioskToken, true);
+        debouncedBroadcastStatus(kioskToken, true);
     }
 
     logInfo(`[Kiosk WS] Client TV display connected for token: ${kioskToken}`);
@@ -205,7 +218,7 @@ function handleKiosk(ws, user, request) {
                 kioskClients.delete(kioskToken);
                 if (!isAdmin) {
                     removeKioskHeartbeat(kioskToken);
-                    broadcastKioskStatusChange(kioskToken, false);
+                    debouncedBroadcastStatus(kioskToken, false);
                 }
             }
         }
