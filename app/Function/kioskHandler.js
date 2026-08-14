@@ -205,6 +205,15 @@ function handleKiosk(ws, user, request) {
                         }
                     }).catch(() => { });
                 }
+            } else if (data.type === 'kiosk_screenshot_captured') {
+                logInfo(`[Kiosk WS] Screenshot captured from TV display: ${kioskToken}`);
+                kioskClients.forEach((clientSet) => {
+                    clientSet.forEach(clientWs => {
+                        if (clientWs.readyState === 1 && clientWs !== ws) {
+                            clientWs.send(JSON.stringify(data));
+                        }
+                    });
+                });
             }
         } catch (_) { }
     });
