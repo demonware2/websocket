@@ -189,7 +189,6 @@ function constantTimeCompare(a, b) {
 }
 
 async function isIPBlocked(normalizedIP) {
-
     if (BLOCKED_IPS.includes(normalizedIP)) {
         return true;
     }
@@ -241,13 +240,10 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
         const searchParams = new URL(request.url, `http://${request.headers.host}`).searchParams;
         const token = searchParams.get('token');
 
-        // const cleanRequestedPath = pathname.replace(/^\/socket/, '');
-
         const cleanRequestedPath = normalizeRequestedPath(pathname);
 
         if (typeRequest === 'ws') {
             const whatsappSecret = searchParams.get('whatsapp_secret');
-            // const validatedSecret = validateWhatsAppSecret(whatsappSecret);
 
             if (RESTRICTED_PATHS.includes(cleanRequestedPath)) {
                 if (!isLocalNetwork(normalizedIP)) {
@@ -257,7 +253,7 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
                     if (whatsappToken) {
                         logInfo('WhatsApp connection authenticated');
-                        return { userId: 'whatsapp', roleId: 'whatsapp' };
+                        return { userId: 'whatsapp', identity: 'whatsapp', roleId: 'whatsapp' };
                     } else {
                         throw new AuthenticationError('Invalid WhatsApp secret key', 'Invalid WhatsApp secret key');
                     }
@@ -302,11 +298,10 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
                 const scope = resolveConnectionScope(authResult);
                 if (scope) {
-                    const allowed = true; // Optimized: Rely on PHP-side session management for per-user limits
+                    const allowed = true;
                     if (!allowed) {
                         await decrementCounter('ws_total_connections');
-                        // Log instead of block
-console.warn(`Soft limit reached for ${scope.redisKey}`);
+                        console.warn(`Soft limit reached for ${scope.redisKey}`);
                     }
                     authResult.connectionKey = scope.redisKey;
                     authResult.connectionLimit = scope.limit;
@@ -340,23 +335,36 @@ console.warn(`Soft limit reached for ${scope.redisKey}`);
 async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChecks = false) {
     try {
         if (!skipRedisChecks) {
-            const isRevoked = await isTokenRevoked(token);
-            if (isRevoked) {
+            const decodedForCheck = jwt.decode(token) || {};
+            const jti = decodedForCheck.jti;
+
+            if (!jti) {
+                throw new AuthenticationError('Invalid token', 'Token missing required JTI claim');
+            }
+
+            const status = await redis.hget(`jwt:meta:${jti}`, 'status');
+            if (status === 'revoked' || status === 'expired') {
                 throw new AuthenticationError('Token revoked', 'Token revoked');
             }
         }
 
         const decoded = jwt.verify(token, JWT_SECRET);
+        const userIdentifier = String(decoded.userId || decoded.identity || 'unknown');
 
         if (!skipRedisChecks) {
-            const storedToken = await redis.get(`jwt_token:${decoded.userId}`);
-            if (!storedToken || !constantTimeCompare(storedToken, token)) {
-                throw new AuthenticationError('Invalid token', `Invalid token for user ${decoded.userId}`);
+            const jti = decoded.jti;
+            if (!jti) {
+                throw new AuthenticationError('Invalid token', 'Token missing required JTI claim');
+            }
+
+            const status = await redis.hget(`jwt:meta:${jti}`, 'status');
+            if (status !== 'active') {
+                throw new AuthenticationError('Invalid token', `Token not active for user ${userIdentifier}`);
             }
         }
 
         if (typeRequest != decoded.type) {
-            throw new AuthenticationError('Invalid request type', `Invalid request type for user ${decoded.userId}`);
+            throw new AuthenticationError('Invalid request type', `Invalid request type for user ${userIdentifier}`);
         }
 
         const publicRoutes = Array.isArray(roleConfig.publicRoutes) ? roleConfig.publicRoutes : [];
@@ -402,26 +410,26 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
         if (requiresRoleCheck) {
             if (userRoles) {
                 logDebug('Roles provided by token', {
-                    userId: decoded.userId,
+                    userId: userIdentifier,
                     roleCount: userRoles.length,
                 });
             } else {
-                userRoles = getUserRolesFromCache(decoded.userId);
+                userRoles = getUserRolesFromCache(userIdentifier);
 
                 logDebug('Role cache lookup', {
-                    userId: decoded.userId,
+                    userId: userIdentifier,
                     cacheHit: !!userRoles,
                 });
 
                 if (!userRoles) {
                     try {
-                        userRoles = await getUserRolesFromDatabase(decoded.userId);
+                        userRoles = await getUserRolesFromDatabase(userIdentifier);
                         if (userRoles && userRoles.length > 0) {
                             userRoles = userRoles.map((role) => parseInt(role, 10)).filter((value) => Number.isInteger(value));
-                            setUserRolesToCache(decoded.userId, userRoles);
+                            setUserRolesToCache(userIdentifier, userRoles);
                         } else {
                             userRoles = [1];
-                            logDebug('Using default role', { userId: decoded.userId });
+                            logDebug('Using default role', { userId: userIdentifier });
                         }
                     } catch (dbError) {
                         logWarning('Database not available, using default role');
@@ -431,13 +439,13 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
             }
 
             if (!userRoles.some((role) => requiredRoles.includes(parseInt(role, 10)))) {
-                throw new AuthenticationError('Insufficient permissions', `Insufficient permissions for user ${decoded.userId} on path ${cleanRequestedPath}`);
+                throw new AuthenticationError('Insufficient permissions', `Insufficient permissions for user ${userIdentifier} on path ${cleanRequestedPath}`);
             }
         } else {
             userRoles = userRoles ? userRoles : [];
             if (userRoles.length > 0) {
                 logDebug('Public route roles preserved from token', {
-                    userId: decoded.userId,
+                    userId: userIdentifier,
                     roleCount: userRoles.length,
                 });
             }
@@ -452,7 +460,7 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
         const authResult = { ...decoded, roleId: primaryRoleId, roles: userRoles };
 
         logInfo('Authentication successful', {
-            userId: decoded.userId,
+            userId: userIdentifier,
             roles: userRoles,
         });
 
@@ -475,7 +483,7 @@ function resolveConnectionScope(authResult) {
     const ttl = Math.max(CONNECTION_COUNTER_TTL, 60);
 
     if (authResult.callCenterInternal && authResult.callCenterInternal.role === 'admin_monitor') {
-        const adminId = authResult.actorId || authResult.userId || 'unknown';
+        const adminId = authResult.actorId || authResult.userId || authResult.identity || 'unknown';
         return {
             redisKey: `ws_connections:monitor:${adminId}`,
             limit: Math.max(1, MAX_MONITOR_CONNECTIONS_PER_ADMIN || 1),
@@ -484,7 +492,7 @@ function resolveConnectionScope(authResult) {
     }
 
     if (authResult.callCenterInternal && authResult.callCenterInternal.role === 'customer') {
-        const customerId = authResult.userId || `session:${authResult.callCenterInternal.sessionId || 'unknown'}`;
+        const customerId = authResult.userId || authResult.identity || `session:${authResult.callCenterInternal.sessionId || 'unknown'}`;
         return {
             redisKey: `ws_connections:customer:${customerId}`,
             limit: Math.max(1, MAX_CUSTOMER_CONNECTIONS_PER_USER || 1),
@@ -492,7 +500,7 @@ function resolveConnectionScope(authResult) {
         };
     }
 
-    const genericId = authResult.userId || 'anonymous';
+    const genericId = authResult.userId || authResult.identity || 'anonymous';
     return {
         redisKey: `ws_connections:user:${genericId}`,
         limit: Math.max(1, MAX_CONNECTIONS_PER_USER || 1),
@@ -555,7 +563,8 @@ async function removeConnection(user) {
     if (typeof user === 'string') {
         connectionKey = `ws_connections:user:${user}`;
     } else if (typeof user === 'object') {
-        connectionKey = user.connectionKey || (user.userId ? `ws_connections:user:${user.userId}` : null);
+        const ident = user.connectionKey || user.userId || user.identity || null;
+        connectionKey = user.connectionKey ? user.connectionKey : (ident ? `ws_connections:user:${ident}` : null);
     }
 
     if (connectionKey) await decrementCounter(connectionKey);
@@ -587,7 +596,14 @@ async function getWhatsappToken(key) {
 }
 
 async function getUserRolesFromDatabase(userId) {
-    const [roles] = await pool.execute('SELECT role_id FROM user_roles WHERE user_id = ?', [userId]);
+    if (typeof userId === 'string' && userId.length === 36) {
+        const [roles] = await pool.execute(
+            'SELECT ur.role_id FROM user_roles ur JOIN users u ON u.id = ur.user_id WHERE u.uuid = ? AND ur.is_active = 1',
+            [userId]
+        );
+        return roles.map(role => role.role_id);
+    }
+    const [roles] = await pool.execute('SELECT role_id FROM user_roles WHERE user_id = ? AND is_active = 1', [userId]);
     const userRoles = roles.map(role => role.role_id);
 
     return userRoles;
@@ -600,22 +616,68 @@ function setUserRolesToCache(userId, roles) {
 async function updateToken(decodedToken, roleId) {
     try {
         const currentTime = Math.floor(Date.now() / 1000);
+        const newJti = typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID().replace(/-/g, '')
+            : crypto.randomBytes(16).toString('hex');
+
+        if (decodedToken && decodedToken.jti) {
+            try {
+                await redis.hmset(`jwt:meta:${decodedToken.jti}`, {
+                    status: 'revoked',
+                    revokedAt: currentTime,
+                    revokedReason: 'token_refresh'
+                });
+                await redis.expire(`jwt:meta:${decodedToken.jti}`, 3600);
+            } catch (refreshMetaErr) {
+                logWarning('Failed to flip old jti on refresh', { jti: decodedToken.jti, error: refreshMetaErr.message });
+            }
+        }
+
         const updatedPayload = {
             ...decodedToken,
             iat: currentTime,
+            nbf: currentTime,
             exp: currentTime + 3600,
+            jti: newJti,
             roleId: roleId
         };
 
-        const oldToken = await redis.get(`jwt_token:${updatedPayload.userId}`);
         const newToken = jwt.sign(updatedPayload, JWT_SECRET);
 
-        if (oldToken) {
-            await redis.sadd('revoked_tokens', oldToken);
-            await redis.expire('revoked_tokens', 3600);
-        }
+        const identity = String(updatedPayload.identity || updatedPayload.userId || '0');
+        const userId = String(updatedPayload.userId || identity);
+        const safeId = identity.replace(/[^a-zA-Z0-9._-]/g, '_') || '0';
+        const typeKey = (updatedPayload.type || 'ws').toLowerCase().replace(/[^a-z0-9_]/g, '');
 
-        await redis.setex(`jwt_token:${updatedPayload.userId}`, 3600, newToken);
+        await redis.hmset(`jwt:meta:${newJti}`, {
+            jti: newJti,
+            identity: identity,
+            userId: userId,
+            username: String(updatedPayload.username || ''),
+            type: typeKey,
+            aud: String(updatedPayload.aud || ''),
+            iss: String(updatedPayload.iss || ''),
+            iat: currentTime,
+            exp: currentTime + 3600,
+            ip: '',
+            userAgent: '',
+            deviceId: String(updatedPayload.deviceId || ''),
+            lastUsedAt: currentTime,
+            lastUsedIp: '',
+            status: 'active',
+            revokedAt: 0,
+            revokedBy: '',
+            revokedReason: '',
+            metadata: JSON.stringify(updatedPayload.md || {})
+        });
+        await redis.expire(`jwt:meta:${newJti}`, 3600);
+        await redis.sadd(`jwt:subject:${safeId}`, newJti);
+        await redis.expire(`jwt:subject:${safeId}`, 604800);
+        await redis.sadd(`jwt:type:${typeKey}`, newJti);
+        await redis.expire(`jwt:type:${typeKey}`, 604800);
+        await redis.sadd(`jwt:subject:${safeId}:type:${typeKey}`, newJti);
+        await redis.expire(`jwt:subject:${safeId}:type:${typeKey}`, 3600);
+        await redis.zadd('jwt:active', currentTime, newJti);
 
         return {
             ...updatedPayload,
@@ -640,7 +702,16 @@ function validateWhatsAppSecret(secret) {
 }
 
 async function isTokenRevoked(token) {
-    return await redis.sismember('revoked_tokens', token);
+    try {
+        const decoded = jwt.decode(token);
+        if (!decoded || !decoded.jti) {
+            return true;
+        }
+        const status = await redis.hget(`jwt:meta:${decoded.jti}`, 'status');
+        return status !== 'active';
+    } catch (e) {
+        return true;
+    }
 }
 
 function invalidateUserRoleCache(userId) {
