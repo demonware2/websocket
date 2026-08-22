@@ -5,6 +5,7 @@ const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandl
 const { handleCallCenter, handleCallCenterAdminBroadcast } = require('./app/Function/callCenterHandler');
 const { handleKiosk } = require('./app/Function/kioskHandler');
 const editorHandler = require('./app/Function/editorHandler');
+const { handleSpaRealtime } = require('./app/Function/spaRealtimeHandler');
 const { removeConnection, normalizeRequestedPath } = require('./app/Helper/authMiddleware');
 const { logInfo, logWarning, logError, logDebug } = require('./app/Helper/errorHandler');
 const Redis = require('ioredis');
@@ -757,6 +758,9 @@ function setupWebSocketServer(webSocketServer) {
                     break;
                 case '/kiosk':
                     handleKiosk(ws, user, request);
+                    break;
+                case '/realtime':
+                    handleSpaRealtime(ws, user, request);
                     break;
                 default:
                     if (cleanRequestedPath === '/kajian-presence' || cleanRequestedPath.startsWith('/kajian-presence/')) {
