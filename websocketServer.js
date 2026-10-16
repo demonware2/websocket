@@ -1,7 +1,7 @@
 const { getSystemInfo } = require('./app/Function/systemInformationMonitor');
 const { handleWhatsapp } = require('./app/Function/whatsappHandler');
 const { getAllDataPM2, getLogsPM2, startProcessPM2, stopProcessPM2, restartProcessPM2 } = require('./app/Function/pm2DataHandler');
-const { handleChat } = require('./app/Function/chatHandler'); // Added chatHandler
+const { handleChat } = require('./app/Function/chatHandler');
 const { handleCallCenter, handleCallCenterAdminBroadcast } = require('./app/Function/callCenterHandler');
 const { handleKiosk } = require('./app/Function/kioskHandler');
 const editorHandler = require('./app/Function/editorHandler');
