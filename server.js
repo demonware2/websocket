@@ -21,8 +21,6 @@ setupWebSocketServer(wss);
 const callCenterPersistence = startCallCenterPersistence();
 const { startDppChatPersistence } = require('./worker/dppChatPersistenceWorker');
 const dppChatPersistence = startDppChatPersistence();
-const { startModularChatPersistence } = require('./worker/modularChatPersistenceWorker');
-const modularChatPersistence = startModularChatPersistence();
 
 server.on('upgrade', async function upgrade(request, socket, head) {
     logDebug(`WebSocket upgrade request from ${socket.remoteAddress} to ${request.url}`);
@@ -104,7 +102,6 @@ try {
             try { editorHandler.cleanup(); } catch (_) {}
             try { callCenterPersistence.stop(); } catch (_) {}
             try { dppChatPersistence.stop(); } catch (_) {}
-            try { modularChatPersistence.stop(); } catch (_) {}
         });
     });
 } catch (_) {
