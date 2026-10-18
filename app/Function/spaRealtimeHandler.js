@@ -20,7 +20,7 @@ const pgPool = new Pool({
     user: process.env.PG_USER || 'siroum_chat_user',
     password: process.env.PG_PASSWORD || '',
     database: process.env.PG_DATABASE || 'siroum_realtime',
-    max: 5,
+    max: parseInt(process.env.PG_POOL_MAX || '20', 10),
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000
 });
@@ -32,32 +32,35 @@ pgPool.on('error', (err) => {
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_MESSAGE_LENGTH = parseInt(process.env.LIVECHAT_MESSAGEMAXLENGTH || '5000', 10);
 const WS_SENDABLE_CONTEXTS = ['direct', 'group'];
+const ROOM_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const READ_SIGNAL_MIN_INTERVAL_MS = 3000;
 
-/**
- * Sengaja tanpa cache: satu pencarian berindeks itu murah, sedangkan hasil yang
- * basi berarti orang yang baru dikeluarkan masih bisa menyimak ruangnya.
- */
-async function isRoomMember(roomUuid, userUuid) {
+async function fetchRoomMembership(roomUuid, userUuid, executor) {
+    const runner = executor || pgPool;
+    const res = await runner.query(
+        `SELECT r.module_context, r.entity_id,
+                EXISTS (SELECT 1 FROM chat_room_members m
+                        WHERE m.room_uuid = r.uuid AND m.user_uuid = $2) AS is_member
+         FROM chat_rooms r WHERE r.uuid = $1 LIMIT 1`,
+        [roomUuid, userUuid]
+    );
+
+    if (res.rows.length === 0) {
+        return false;
+    }
+
+    const row = res.rows[0];
+    if (row.is_member === true) {
+        return true;
+    }
+
+    return row.module_context === 'direct'
+        && String(row.entity_id || '').split('__').includes(userUuid);
+}
+
+async function isRoomMember(roomUuid, userUuid, executor) {
     try {
-        const res = await pgPool.query(
-            `SELECT r.module_context, r.entity_id,
-                    EXISTS (SELECT 1 FROM chat_room_members m
-                            WHERE m.room_uuid = r.uuid AND m.user_uuid = $2) AS is_member
-             FROM chat_rooms r WHERE r.uuid = $1 LIMIT 1`,
-            [roomUuid, userUuid]
-        );
-
-        let ok = false;
-        if (res.rows.length > 0) {
-            const row = res.rows[0];
-            ok = row.is_member === true;
-
-            if (!ok && row.module_context === 'direct') {
-                ok = String(row.entity_id || '').split('__').includes(userUuid);
-            }
-        }
-
-        return ok;
+        return await fetchRoomMembership(roomUuid, userUuid, executor);
     } catch (e) {
         logError('[SpaRealtime] Membership check failed', { error: e.message, roomUuid });
         return false;
@@ -74,8 +77,8 @@ redisCmd.on('error', (err) => {
 
 const IDEMPOTENCY_PREFIX = 'chat_idem_';
 const IDEMPOTENCY_TTL = 600;
-
-const CHANNEL_GRANT_PREFIX = 'ws_grant_';
+const CHANNEL_GRANT_PREFIX = 'ws_grant_helpdesk_';
+const LEGACY_CHANNEL_GRANT_PREFIX = 'ws_grant_';
 
 const HELPDESK_AGENT_ROLES = (process.env.LIVECHAT_AGENT_ROLE_IDS || '1,64,65,66,67,68')
     .split(',')
@@ -103,6 +106,14 @@ redisSub.on('message', (channel, message) => {
         logWarning('[SpaRealtime] Invalid JSON message from Redis:', { message, error: e.message });
     }
 });
+
+/**
+ * Terbitkan peristiwa ke seluruh instans WebSocket lewat Redis.
+ */
+function publishRealtimeEvent(channelName, payload) {
+    redisCmd.publish(REDIS_CHANNEL, JSON.stringify({ channel: channelName, ...payload }))
+        .catch((e) => logWarning('[SpaRealtime] Publish failed', { error: e.message, channelName }));
+}
 
 /**
  * Broadcast message to all verified subscribers of a channel
@@ -216,7 +227,12 @@ function isHelpdeskAgent(user) {
 async function hasChannelGrant(userUuid, channelName) {
     try {
         const exists = await redisCmd.exists(CHANNEL_GRANT_PREFIX + userUuid + '_' + channelName);
-        return exists === 1;
+        if (exists === 1) {
+            return true;
+        }
+
+        const legacy = await redisCmd.exists(LEGACY_CHANNEL_GRANT_PREFIX + userUuid + '_' + channelName);
+        return legacy === 1;
     } catch (e) {
         logError('[SpaRealtime] Channel grant check failed', { error: e.message, channelName });
         return false;
@@ -272,7 +288,7 @@ async function handleChatSend(ws, user, payload) {
             return reject('Ruang ini tidak mendukung pengiriman lewat WebSocket');
         }
 
-        if (!await isRoomMember(roomUuid, senderUuid)) {
+        if (!await fetchRoomMembership(roomUuid, senderUuid, client)) {
             return reject('Anda bukan anggota ruang ini');
         }
 
@@ -360,6 +376,86 @@ async function handleChatSend(ws, user, payload) {
     }
 }
 
+function handleChatTyping(ws, user, payload) {
+    const roomId = String(payload.room_uuid || payload.conversation_uuid || '').trim();
+    if (!ROOM_ID_PATTERN.test(roomId)) return;
+
+    const senderUuid = String(user?.userId || '');
+    if (!UUID_PATTERN.test(senderUuid)) return;
+
+    const roomChannel = 'chat:room_' + roomId;
+    if (!ws.subscribedChannels || !ws.subscribedChannels.has(roomChannel)) return;
+
+    const event = {
+        action: 'custom_event',
+        event: 'typing',
+        room_uuid: roomId,
+        user_uuid: senderUuid,
+        user_name: user?.name || user?.username || 'Rekan',
+        sender_role: isHelpdeskAgent(user) ? 'petugas' : 'pemohon',
+        is_typing: payload.is_typing !== false
+    };
+
+    publishRealtimeEvent(roomChannel, event);
+
+    const supportChannel = 'chat:room_support_' + roomId;
+    if (ws.subscribedChannels.has(supportChannel)) {
+        publishRealtimeEvent(supportChannel, event);
+    }
+}
+
+async function handleChatRead(ws, user, payload) {
+    const roomUuid = String(payload.room_uuid || payload.conversation_uuid || '').trim();
+    if (!UUID_PATTERN.test(roomUuid)) return;
+
+    const readerUuid = String(user?.userId || '');
+    if (!UUID_PATTERN.test(readerUuid)) return;
+
+    if (!ws.lastReadSignalAt) ws.lastReadSignalAt = new Map();
+    const now = Date.now();
+    if (now - (ws.lastReadSignalAt.get(roomUuid) || 0) < READ_SIGNAL_MIN_INTERVAL_MS) return;
+    ws.lastReadSignalAt.set(roomUuid, now);
+
+    const client = await pgPool.connect();
+    try {
+        if (!await fetchRoomMembership(roomUuid, readerUuid, client)) return;
+
+        await client.query('BEGIN');
+
+        await client.query(
+            `UPDATE chat_messages
+                SET read_by = COALESCE(read_by, '[]'::jsonb) || jsonb_build_array($2::text)
+              WHERE room_uuid = $1
+                AND created_at > COALESCE(
+                        (SELECT last_read_at FROM chat_room_members
+                          WHERE room_uuid = $1 AND user_uuid = $2),
+                        '-infinity'::timestamptz)
+                AND NOT (COALESCE(read_by, '[]'::jsonb) @> jsonb_build_array($2::text))`,
+            [roomUuid, readerUuid]
+        );
+
+        await client.query(
+            `UPDATE chat_room_members SET last_read_at = NOW()
+              WHERE room_uuid = $1 AND user_uuid = $2`,
+            [roomUuid, readerUuid]
+        );
+
+        await client.query('COMMIT');
+
+        publishRealtimeEvent('chat:room_' + roomUuid, {
+            action: 'custom_event',
+            event: 'messages_read',
+            room_uuid: roomUuid,
+            reader_uuid: readerUuid
+        });
+    } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        logError('[SpaRealtime] chat_read failed', { error: e.message, roomUuid });
+    } finally {
+        client.release();
+    }
+}
+
 /**
  * Handle new WebSocket connection to /realtime
  */
@@ -432,6 +528,14 @@ function handleSpaRealtime(ws, user, request) {
             if (msg.action === 'chat_send') {
                 await handleChatSend(ws, user, msg.payload || {});
             }
+
+            if (msg.action === 'chat_typing') {
+                handleChatTyping(ws, user, msg.payload || {});
+            }
+
+            if (msg.action === 'chat_read') {
+                await handleChatRead(ws, user, msg.payload || {});
+            }
         } catch (e) {
             logWarning('[SpaRealtime] Error processing client message:', { error: e.message });
         }
@@ -456,5 +560,7 @@ module.exports = {
     handleSpaRealtime,
     broadcastToChannel,
     isAuthorizedForChannel,
-    handleChatSend
+    handleChatSend,
+    handleChatTyping,
+    handleChatRead
 };
