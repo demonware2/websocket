@@ -33,15 +33,23 @@ let cachedSystemData = null;
 let samplingInterval = null;
 let inflightSample = null;
 const SAMPLE_INTERVAL_MS = parseInt(process.env.SI_SAMPLE_INTERVAL_MS || '5000', 10);
-const SAMPLE_TIMEOUT_MS = parseInt(process.env.SI_SAMPLE_TIMEOUT_MS || '4500', 10);
+// gatherSystemData() includes a blocking `mpstat 1 1`, so the budget has to sit
+// well clear of one second or a loaded host never produces a single sample.
+const SAMPLE_TIMEOUT_MS = parseInt(process.env.SI_SAMPLE_TIMEOUT_MS || '12000', 10);
+
+// Callers must always receive an object. Returning null here used to travel all
+// the way to the browser as the literal "null" frame and froze the dashboard.
+function warmingPayload(reason) {
+  return { timestamp: Date.now(), status: 'warming', reason };
+}
 
 async function sampleSystemInfoOnce() {
   try {
     const data = await withTimeout(gatherSystemData(), SAMPLE_TIMEOUT_MS, null);
     if (data) cachedSystemData = data;
-    return cachedSystemData;
+    return cachedSystemData || warmingPayload('sample_timeout');
   } catch (e) {
-    return cachedSystemData || { timestamp: Date.now(), error: e.message };
+    return cachedSystemData || warmingPayload(e.message);
   }
 }
 
@@ -369,50 +377,93 @@ async function getUserInfo() {
 
 let servicesCache = { data: null, ts: 0 };
 const SERVICES_TTL_MS = parseInt(process.env.SI_SERVICES_TTL_MS || '30000', 10);
+
+function escapeRegExpLiteral(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Attaches %cpu / %mem from `ps` to the units we just listed.
+// `comm` is truncated to 15 chars by the kernel, so matching stays prefix based.
+async function attachServiceUsage(services) {
+  if (!services.length) return services;
+  const shortNames = services.map(s => s.name.replace(/\.service$/, ''));
+  const pattern = shortNames.map(escapeRegExpLiteral).join('|');
+  const { error, stdout } = await safeExec(`ps -eo pid,pmem,pcpu,comm --no-header | grep -E '(${pattern})' | grep -v grep`);
+  if (error || !(stdout || '').trim()) return services;
+  stdout.trim().split('\n').forEach(line => {
+    const [, mem, cpu, comm] = line.trim().split(/\s+/);
+    if (!comm) return;
+    const service = services.find((s, i) => comm.includes(shortNames[i])
+      || (comm.length === 15 && shortNames[i].startsWith(comm)));
+    if (!service) return;
+    service.cpu = (service.cpu || 0) + (parseFloat(cpu) || 0);
+    service.mem = (service.mem || 0) + (parseFloat(mem) || 0);
+  });
+  return services;
+}
+
+// systemctl columns are UNIT LOAD ACTIVE SUB DESCRIPTION. Units in a failed or
+// not-found state get a leading bullet that shifts every column by one.
+function parseSystemctlUnits(stdout) {
+  return (stdout || '').trim().split('\n')
+    .map(line => line.trim().replace(/^[●•*]\s+/, ''))
+    .filter(line => line !== '')
+    .map(line => {
+      const parts = line.split(/\s+/);
+      if (parts.length < 4) return null;
+      const [name, load, active, sub] = parts;
+      return {
+        name,
+        load,
+        active,
+        sub,
+        description: parts.slice(4).join(' '),
+        running: sub === 'running',
+        failed: active === 'failed' || sub === 'failed',
+        cpu: null,
+        mem: null
+      };
+    })
+    .filter(Boolean);
+}
+
+function parseServiceStatusAll(stdout) {
+  return (stdout || '').trim().split('\n').map(line => {
+    const match = line.trim().match(/\[\s*([+\-?])\s*\]\s+(.+)$/);
+    if (!match) return null;
+    const isRunning = match[1] === '+';
+    return {
+      name: match[2],
+      load: 'loaded',
+      active: match[1] === '?' ? 'unknown' : (isRunning ? 'active' : 'inactive'),
+      sub: match[1] === '?' ? 'unknown' : (isRunning ? 'running' : 'dead'),
+      description: '',
+      running: isRunning,
+      failed: false,
+      cpu: null,
+      mem: null
+    };
+  }).filter(Boolean);
+}
+
 async function getServicesInfo() {
   const now = Date.now();
   if (servicesCache.data && now - servicesCache.ts < SERVICES_TTL_MS) return servicesCache.data;
-  const { error, stdout } = await safeExec('systemctl list-units --type=service --state=active,running,failed --no-legend 2>/dev/null || echo ""');
-  if (error || !stdout.trim()) {
-    const { error: e2, stdout: s2 } = await safeExec('service --status-all 2>&1');
-    if (e2) return [];
-    try {
-      const lines = (s2 || '').trim().split('\n');
-      const services = lines.map(line => {
-        const match = line.trim().match(/\[\s*([+-?])\s*\]\s+(.+)$/);
-        if (!match) return null;
-        const status = match[1];
-        const name = match[2];
-        return { name, running: status === '+', cpu: null, mem: null };
-      }).filter(Boolean);
-      servicesCache = { data: services, ts: now };
-      return services;
-    } catch (_) { return []; }
-  } else {
-    try {
-      const lines = (stdout || '').trim().split('\n');
-      const services = lines.filter(line => line.trim() !== '').map(line => {
-        const parts = line.trim().split(/\s+/);
-        let name = '';
-        let state = '';
-        if (parts.length >= 3) { name = parts[0]; state = parts[2]; }
-        return { name, running: state === 'running', cpu: null, mem: null };
-      });
-      if (services.length > 0) {
-        const serviceNames = services.map(s => s.name.replace('.service', '')).join('|');
-        const { error: psErr, stdout: psOut } = await safeExec(`ps -eo pid,pmem,pcpu,comm | grep -E '(${serviceNames})' | grep -v grep`);
-        if (!psErr && (psOut || '').trim()) {
-          const psLines = psOut.trim().split('\n');
-          psLines.forEach(psLine => {
-            const [pid, mem, cpu, comm] = psLine.trim().split(/\s+/);
-            const service = services.find(s => comm.includes(s.name.replace('.service', '')));
-            if (service) { service.cpu = parseFloat(cpu); service.mem = parseFloat(mem); }
-          });
-        }
-      }
-      servicesCache = { data: services, ts: now };
-      return services;
-    } catch (_) { return []; }
+  try {
+    const { stdout } = await safeExec('systemctl list-units --type=service --state=active,running,failed --no-legend 2>/dev/null || echo ""');
+    let services = parseSystemctlUnits(stdout);
+
+    if (!services.length) {
+      const { error: fallbackErr, stdout: fallbackOut } = await safeExec('service --status-all 2>&1');
+      if (fallbackErr) return servicesCache.data || [];
+      services = parseServiceStatusAll(fallbackOut);
+    }
+
+    await attachServiceUsage(services);
+    servicesCache = { data: services, ts: now };
+    return services;
+  } catch (_) {
+    return servicesCache.data || [];
   }
 }
 
@@ -486,44 +537,45 @@ function getSystemInfoRaw() {
 
 let __versionsCache = { data: null, ts: 0 };
 const VERSIONS_TTL_MS = parseInt(process.env.SI_VERSIONS_TTL_MS || String(5 * 60 * 1000), 10);
+
+// Candidate binaries differ between the Ubuntu dev box and the CentOS 7 production
+// host (apache2/httpd, php/php83), so every probe tries each name in turn.
+const VERSION_PROBES = [
+  { key: 'node', binaries: ['node'], args: '-v', pattern: /v?([0-9][^\s]*)/ },
+  { key: 'npm', binaries: ['npm'], args: '-v', pattern: /([0-9][^\s]*)/ },
+  { key: 'kernel', binaries: ['uname'], args: '-r', pattern: /(\S+)/ },
+  { key: 'openssl', binaries: ['openssl'], args: 'version', pattern: /OpenSSL\s+(\S+)/i },
+  { key: 'php', binaries: ['php', 'php83', 'php8.3', 'php82', 'php8.2'], args: '-v', pattern: /^PHP\s+(\S+)/m },
+  { key: 'mysql', binaries: ['mysql', 'mariadb'], args: '--version', pattern: /(?:Distrib|Ver)\s+([0-9][^\s,]*)/i },
+  { key: 'apache', binaries: ['apache2', 'httpd'], args: '-v', pattern: /Apache\/(\S+)/i },
+  { key: 'nginx', binaries: ['nginx'], args: '-v', pattern: /nginx\/(\S+)/i }
+];
+
+// A probe only reports when its pattern matches. Without that guard a missing
+// binary leaks the shell's "command not found" text as if it were a version.
+async function probeVersion(probe) {
+  for (const binary of probe.binaries) {
+    const { error, stdout } = await safeExec(`command -v ${binary} >/dev/null 2>&1 && ${binary} ${probe.args} 2>&1`);
+    if (error) continue;
+    const match = (stdout || '').trim().match(probe.pattern);
+    if (match && match[1]) {
+      let version = match[1];
+      if (probe.key === 'openssl' && version.includes('quic')) {
+        version = version.split('+')[0] + '+quic';
+      }
+      return version;
+    }
+  }
+  return null;
+}
+
 async function getVersionsInfo() {
   const now = Date.now();
   if (__versionsCache.data && now - __versionsCache.ts < VERSIONS_TTL_MS) return __versionsCache.data;
-  const commands = {
-    node: 'node -v 2>/dev/null || echo "N/A"',
-    npm: 'npm -v 2>/dev/null || echo "N/A"',
-    kernel: 'uname -r 2>/dev/null || echo "N/A"',
-    openssl: 'openssl version 2>/dev/null || echo "N/A"',
-    php: 'php -v 2>/dev/null | head -n 1 || echo "N/A"',
-    mysql: 'mysql --version 2>/dev/null || echo "N/A"',
-    apache: 'apache2 -v 2>/dev/null || httpd -v 2>/dev/null || echo "N/A"',
-    nginx: 'nginx -v 2>&1 || echo "N/A"'
-  };
   const versions = {};
-  for (const [key, cmd] of Object.entries(commands)) {
-    const { error, stdout } = await safeExec(cmd);
-    let version = error ? 'N/A' : (stdout || '').trim();
-    if (key === 'openssl') {
-      const match = version.match(/OpenSSL\s+(\S+)/i);
-      version = match ? match[1] : version;
-      if (version.includes('quic')) {
-        const parts = version.split('+');
-        if (parts.length > 1) version = parts[0] + '+quic';
-      }
-    } else if (key === 'php') {
-      const match = version.match(/PHP\s+(\S+)/);
-      version = match ? match[1] : version;
-    } else if (key === 'mysql') {
-      const match = version.match(/Distrib\s+(\S+)/);
-      version = match ? match[1] : version;
-    } else if (key === 'apache') {
-      const match = version.match(/version:?\s+Apache\/(\S+)/i);
-      version = match ? match[1] : version;
-    } else if (key === 'nginx') {
-      const match = version.match(/nginx\/(\S+)/);
-      version = match ? match[1] : version;
-    }
-    if (version !== 'N/A') versions[key] = version;
+  for (const probe of VERSION_PROBES) {
+    const version = await probeVersion(probe);
+    if (version) versions[probe.key] = version;
   }
   __versionsCache = { data: versions, ts: now };
   return versions;

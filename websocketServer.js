@@ -952,6 +952,7 @@ function handleSystemInfo(ws, user, request) {
         }
     };
 
+    getSystemInfoHandler();
     intervalId = setInterval(getSystemInfoHandler, 5000);
 
     ws.on('close', () => {
@@ -960,15 +961,31 @@ function handleSystemInfo(ws, user, request) {
     });
 }
 
+// Only the charts the dashboard actually renders. Unfiltered allmetrics is ~785KB
+// per tick against ~30KB here, and that ran every 2s for every viewer.
+const NETDATA_CHART_FILTER = [
+    'system.*',
+    'mem.swap',
+    'mem.pgfaults',
+    'systemd_*.mem',
+    'systemd_*.pids_current'
+].join(' ');
+const NETDATA_METRICS_PATH = '/api/v1/allmetrics?format=json&filter=' + encodeURIComponent(NETDATA_CHART_FILTER);
+
 function handleNetdata(ws, user, request) {
     const http = require('http');
     let intervalId;
+    let fetchInFlight = false;
 
     const sendNetdataMetrics = () => {
-        http.get('http://127.0.0.1:19999/api/v1/allmetrics?format=json', (res) => {
+        if (fetchInFlight || !ws || ws.readyState !== 1) return;
+        fetchInFlight = true;
+
+        const req = http.get({ host: '127.0.0.1', port: 19999, path: NETDATA_METRICS_PATH }, (res) => {
             let body = '';
             res.on('data', (chunk) => body += chunk);
             res.on('end', () => {
+                fetchInFlight = false;
                 try {
                     if (ws && ws.readyState === 1) {
                         const json = JSON.parse(body);
@@ -978,7 +995,11 @@ function handleNetdata(ws, user, request) {
                     // Ignore parse errors
                 }
             });
-        }).on('error', (err) => {
+        });
+
+        req.setTimeout(4000, () => req.destroy(new Error('netdata request timeout')));
+        req.on('error', (err) => {
+            fetchInFlight = false;
             logWarning('Netdata local fetch error', { message: err.message });
         });
     };
