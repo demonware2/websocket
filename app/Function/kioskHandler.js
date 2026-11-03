@@ -10,25 +10,33 @@ const redisConfig = {
 
 const subscriber = new Redis(redisConfig);
 const redisPublisher = new Redis(redisConfig);
-const kioskClients = new Map(); // kioskToken -> Set of ws connections
+const kioskClients = new Map(); // tokenVariant -> Set of ws connections
+const kioskStates = new Map();
+
+function getTokenVariants(token) {
+    if (!token) return [];
+    const raw = String(token).trim();
+    const cleanKiosk = raw.replace(/^kiosk_/, '');
+    const cleanKsk = raw.replace(/^ksk_/, '');
+    const bareHex = raw.replace(/^kiosk_|^ksk_/, '');
+    const prefixedKsk = 'ksk_' + bareHex;
+    const prefixedKiosk = 'kiosk_' + bareHex;
+    const prefixedBoth = 'kiosk_ksk_' + bareHex;
+
+    return [...new Set([raw, cleanKiosk, cleanKsk, bareHex, prefixedKsk, prefixedKiosk, prefixedBoth])];
+}
 
 function updateKioskHeartbeat(token) {
     if (!token) return;
     try {
-        const rawToken = String(token);
-        const cleanToken = rawToken.startsWith('kiosk_') ? rawToken.substring(6) : rawToken;
-        const prefixedToken = 'kiosk_' + cleanToken;
-
-        const md5Raw = crypto.createHash('md5').update(rawToken).digest('hex');
-        const md5Clean = crypto.createHash('md5').update(cleanToken).digest('hex');
-        const md5Prefixed = crypto.createHash('md5').update(prefixedToken).digest('hex');
+        const variants = getTokenVariants(token);
         const val = new Date().toISOString().replace('T', ' ').substring(0, 19);
 
-        redisPublisher.setex(`kiosk:heartbeat:${md5Raw}`, 150, val).catch(() => { });
-        redisPublisher.setex(`kiosk:heartbeat:${md5Clean}`, 150, val).catch(() => { });
-        redisPublisher.setex(`kiosk:heartbeat:${md5Prefixed}`, 150, val).catch(() => { });
-        redisPublisher.setex(`kiosk_heartbeat_${md5Raw}`, 150, val).catch(() => { });
-        redisPublisher.setex(`kiosk_heartbeat_${md5Clean}`, 150, val).catch(() => { });
+        variants.forEach(t => {
+            const md5 = crypto.createHash('md5').update(t).digest('hex');
+            redisPublisher.setex(`kiosk:heartbeat:${md5}`, 150, val).catch(() => { });
+            redisPublisher.setex(`kiosk_heartbeat_${md5}`, 150, val).catch(() => { });
+        });
     } catch (e) {
         logWarning('[Kiosk WS] Heartbeat update error', { error: e.message });
     }
@@ -37,19 +45,12 @@ function updateKioskHeartbeat(token) {
 function removeKioskHeartbeat(token) {
     if (!token) return;
     try {
-        const rawToken = String(token);
-        const cleanToken = rawToken.startsWith('kiosk_') ? rawToken.substring(6) : rawToken;
-        const prefixedToken = 'kiosk_' + cleanToken;
-
-        const md5Raw = crypto.createHash('md5').update(rawToken).digest('hex');
-        const md5Clean = crypto.createHash('md5').update(cleanToken).digest('hex');
-        const md5Prefixed = crypto.createHash('md5').update(prefixedToken).digest('hex');
-
-        redisPublisher.del(`kiosk:heartbeat:${md5Raw}`).catch(() => { });
-        redisPublisher.del(`kiosk:heartbeat:${md5Clean}`).catch(() => { });
-        redisPublisher.del(`kiosk:heartbeat:${md5Prefixed}`).catch(() => { });
-        redisPublisher.del(`kiosk_heartbeat_${md5Raw}`).catch(() => { });
-        redisPublisher.del(`kiosk_heartbeat_${md5Clean}`).catch(() => { });
+        const variants = getTokenVariants(token);
+        variants.forEach(t => {
+            const md5 = crypto.createHash('md5').update(t).digest('hex');
+            redisPublisher.del(`kiosk:heartbeat:${md5}`).catch(() => { });
+            redisPublisher.del(`kiosk_heartbeat_${md5}`).catch(() => { });
+        });
     } catch (e) {
         logWarning('[Kiosk WS] Heartbeat remove error', { error: e.message });
     }
@@ -65,9 +66,11 @@ function broadcastKioskStatusChange(token, isOnline) {
             timestamp: new Date().toISOString()
         };
 
+        const sentSockets = new Set();
         kioskClients.forEach((clientSet) => {
             clientSet.forEach(ws => {
-                if (ws.readyState === 1) {
+                if (ws.readyState === 1 && !sentSockets.has(ws)) {
+                    sentSockets.add(ws);
                     ws.send(JSON.stringify(payload));
                 }
             });
@@ -85,7 +88,7 @@ function debouncedBroadcastStatus(token, isOnline) {
     statusDebounceTimers.set(token, setTimeout(() => {
         statusDebounceTimers.delete(token);
         broadcastKioskStatusChange(token, isOnline);
-    }, 5000));
+    }, 1000));
 }
 
 subscriber.subscribe('kiosk:events', (err, count) => {
@@ -103,10 +106,27 @@ subscriber.on('message', (channel, message) => {
             const rawTarget = data.kiosk_token || data.token;
 
             if (rawTarget) {
-                const cleanTarget = rawTarget.startsWith('kiosk_') ? rawTarget.substring(6) : rawTarget;
-                const prefixedTarget = 'kiosk_' + cleanTarget;
+                const variants = getTokenVariants(rawTarget);
+                let clientSet = null;
 
-                const clientSet = kioskClients.get(cleanTarget) || kioskClients.get(prefixedTarget) || kioskClients.get(rawTarget);
+                for (const v of variants) {
+                    const set = kioskClients.get(v);
+                    if (set && set.size > 0) {
+                        clientSet = set;
+                        break;
+                    }
+                }
+
+                if (!clientSet || clientSet.size === 0) {
+                    const bareTarget = String(rawTarget).replace(/^kiosk_|^ksk_/, '');
+                    for (const [key, set] of kioskClients.entries()) {
+                        const bareKey = String(key).replace(/^kiosk_|^ksk_/, '');
+                        if (bareKey === bareTarget && set && set.size > 0) {
+                            clientSet = set;
+                            break;
+                        }
+                    }
+                }
 
                 if (clientSet && clientSet.size > 0) {
                     clientSet.forEach(ws => {
@@ -118,10 +138,25 @@ subscriber.on('message', (channel, message) => {
                 } else {
                     logWarning(`[Kiosk WS] No active WebSocket connection found for target token: ${rawTarget}`);
                 }
+
+                // Also notify connected admin management clients of dispatched command
+                const sentSockets = new Set();
+                kioskClients.forEach((set, key) => {
+                    if (String(key).startsWith('admin_')) {
+                        set.forEach(ws => {
+                            if (ws.readyState === 1 && !sentSockets.has(ws)) {
+                                sentSockets.add(ws);
+                                ws.send(JSON.stringify(data));
+                            }
+                        });
+                    }
+                });
             } else {
+                const sentSockets = new Set();
                 kioskClients.forEach((clientSet) => {
                     clientSet.forEach(ws => {
-                        if (ws.readyState === 1) {
+                        if (ws.readyState === 1 && !sentSockets.has(ws)) {
+                            sentSockets.add(ws);
                             ws.send(JSON.stringify(data));
                         }
                     });
@@ -133,20 +168,46 @@ subscriber.on('message', (channel, message) => {
     }
 });
 
-const kioskStates = new Map();
-
 function handleKiosk(ws, user, request) {
     const searchParams = new URL(request.url, `http://${request.headers.host}`).searchParams;
-    let kioskToken = searchParams.get('kiosk_token') || (user && user.kiosk_token);
+
+    const roleParam = searchParams.get('role');
+    const isAdmin = roleParam === 'admin' 
+        || (user && user.role === 'admin')
+        || (user && user.md && user.md.role === 'admin')
+        || (user && user.identity && user.identity.startsWith('admin_'))
+        || (user && user.userId && String(user.userId).startsWith('admin_'));
+
+    let kioskToken = searchParams.get('kiosk_token')
+        || (user && user.kiosk_token)
+        || (user && user.md && user.md.kiosk_token)
+        || (user && user.metadata && user.metadata.kiosk_token);
+
+    if (!kioskToken && user && user.identity) {
+        if (user.identity.startsWith('kiosk_')) {
+            kioskToken = user.identity.substring(6);
+        } else if (user.identity.startsWith('admin_')) {
+            kioskToken = user.identity;
+        }
+    }
 
     if (!kioskToken && user && user.userId) {
-        kioskToken = user.userId.startsWith('kiosk_') ? user.userId.substring(6) : user.userId;
+        if (String(user.userId).startsWith('kiosk_')) {
+            kioskToken = String(user.userId).substring(6);
+        } else if (String(user.userId).startsWith('admin_')) {
+            kioskToken = String(user.userId);
+        }
     }
+
     if (!kioskToken && searchParams.get('token')) {
         const queryTok = searchParams.get('token');
         if (!queryTok.startsWith('eyJ')) {
             kioskToken = queryTok;
         }
+    }
+
+    if (!kioskToken && isAdmin) {
+        kioskToken = (user && user.identity) || ('admin_' + ((user && user.userId) || 'session'));
     }
 
     if (!kioskToken) {
@@ -155,21 +216,34 @@ function handleKiosk(ws, user, request) {
         return;
     }
 
+    // Register ws connection in kioskClients
     if (!kioskClients.has(kioskToken)) {
         kioskClients.set(kioskToken, new Set());
     }
     kioskClients.get(kioskToken).add(ws);
 
-    const isAdmin = String(kioskToken).startsWith('admin_');
     if (!isAdmin) {
-        updateKioskHeartbeat(kioskToken);
-    }
+        // Register under all token variants so any command lookup succeeds
+        const variants = getTokenVariants(kioskToken);
+        variants.forEach(v => {
+            if (!kioskClients.has(v)) {
+                kioskClients.set(v, new Set());
+            }
+            kioskClients.get(v).add(ws);
+        });
 
-    logInfo(`[Kiosk WS] Client TV display connected for token: ${kioskToken}`);
+        updateKioskHeartbeat(kioskToken);
+        debouncedBroadcastStatus(kioskToken, true);
+        logInfo(`[Kiosk WS] Client TV display connected for token: ${kioskToken}`);
+    } else {
+        logInfo(`[Kiosk WS] Admin management client connected: ${kioskToken}`);
+    }
 
     ws.send(JSON.stringify({
         type: 'connection_established',
         status: true,
+        is_admin: isAdmin,
+        kiosk_token: kioskToken,
         message: 'Terhubung ke SIROUM Kiosk WebSocket Server',
         timestamp: new Date().toISOString()
     }));
@@ -186,9 +260,11 @@ function handleKiosk(ws, user, request) {
                 kioskStates.set(cleanTok, data);
                 redisPublisher.setex('kiosk:state:' + cleanTok, 86400, JSON.stringify(data)).catch(() => { });
 
+                const sentSockets = new Set();
                 kioskClients.forEach((clientSet) => {
                     clientSet.forEach(clientWs => {
-                        if (clientWs.readyState === 1 && clientWs !== ws) {
+                        if (clientWs.readyState === 1 && clientWs !== ws && !sentSockets.has(clientWs)) {
+                            sentSockets.add(clientWs);
                             clientWs.send(JSON.stringify(data));
                         }
                     });
@@ -207,9 +283,11 @@ function handleKiosk(ws, user, request) {
                 }
             } else if (data.type === 'kiosk_screenshot_captured') {
                 logInfo(`[Kiosk WS] Screenshot captured from TV display: ${kioskToken}`);
+                const sentSockets = new Set();
                 kioskClients.forEach((clientSet) => {
                     clientSet.forEach(clientWs => {
-                        if (clientWs.readyState === 1 && clientWs !== ws) {
+                        if (clientWs.readyState === 1 && clientWs !== ws && !sentSockets.has(clientWs)) {
+                            sentSockets.add(clientWs);
                             clientWs.send(JSON.stringify(data));
                         }
                     });
@@ -219,17 +297,34 @@ function handleKiosk(ws, user, request) {
     });
 
     ws.on('close', () => {
-        if (kioskClients.has(kioskToken)) {
-            const clientSet = kioskClients.get(kioskToken);
-            clientSet.delete(ws);
-            if (clientSet.size === 0) {
-                kioskClients.delete(kioskToken);
-                if (!isAdmin) {
-                    removeKioskHeartbeat(kioskToken);
+        if (!isAdmin) {
+            const variants = getTokenVariants(kioskToken);
+            variants.forEach(v => {
+                if (kioskClients.has(v)) {
+                    const clientSet = kioskClients.get(v);
+                    clientSet.delete(ws);
+                    if (clientSet.size === 0) {
+                        kioskClients.delete(v);
+                    }
+                }
+            });
+
+            const remaining = kioskClients.get(kioskToken);
+            if (!remaining || remaining.size === 0) {
+                removeKioskHeartbeat(kioskToken);
+                debouncedBroadcastStatus(kioskToken, false);
+            }
+            logInfo(`[Kiosk WS] Client TV display disconnected for token: ${kioskToken}`);
+        } else {
+            if (kioskClients.has(kioskToken)) {
+                const clientSet = kioskClients.get(kioskToken);
+                clientSet.delete(ws);
+                if (clientSet.size === 0) {
+                    kioskClients.delete(kioskToken);
                 }
             }
+            logInfo(`[Kiosk WS] Admin management client disconnected: ${kioskToken}`);
         }
-        logInfo(`[Kiosk WS] Client TV display disconnected for token: ${kioskToken}`);
     });
 }
 

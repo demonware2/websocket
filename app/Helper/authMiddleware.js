@@ -322,12 +322,20 @@ async function verifyAuthentication(request, pathname, typeRequest, protocol) {
 
         return authResult;
     } catch (error) {
-        logWarning('Authentication error', {
-            error: error.message,
-            stack: error.stack,
-            pathname,
-            typeRequest,
-        });
+        if (error.name === 'TokenExpiredError' || (error.message && error.message.includes('jwt expired'))) {
+            logDebug('Authentication token expired', {
+                error: error.message,
+                pathname,
+                typeRequest,
+            });
+        } else {
+            logWarning('Authentication error', {
+                error: error.message,
+                stack: error.stack,
+                pathname,
+                typeRequest,
+            });
+        }
         return null;
     }
 }
@@ -466,11 +474,18 @@ async function verifyToken(token, cleanRequestedPath, typeRequest, skipRedisChec
 
         return authResult;
     } catch (error) {
-        logWarning('verifyToken error', {
-            path: cleanRequestedPath,
-            message: error.message,
-            stack: error.stack,
-        });
+        if (error.name === 'TokenExpiredError') {
+            logDebug('verifyToken expired', {
+                path: cleanRequestedPath,
+                message: error.message,
+            });
+        } else {
+            logWarning('verifyToken error', {
+                path: cleanRequestedPath,
+                message: error.message,
+                stack: error.stack,
+            });
+        }
         throw error;
     }
 }
