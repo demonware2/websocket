@@ -1,6 +1,7 @@
 const Redis = require('ioredis');
 const { Pool } = require('pg');
 const { logInfo, logWarning, logError, logDebug } = require('../Helper/errorHandler');
+const { unpackFrame } = require('../Helper/payloadCodec');
 
 /**
  * Universal Realtime Channel Manager for Siroum Template Engine & SPA
@@ -476,7 +477,7 @@ function handleSpaRealtime(ws, user, request) {
 
     ws.on('message', async (data) => {
         try {
-            const msg = JSON.parse(data.toString());
+            const msg = unpackFrame(JSON.parse(data.toString()));
 
             if (msg.action === 'subscribe' && msg.channel) {
                 const channel = String(msg.channel).trim();
